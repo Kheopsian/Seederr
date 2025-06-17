@@ -1,39 +1,41 @@
-# Nom du workflow qui apparaîtra dans l'onglet "Actions" de GitHub
+# Name of the workflow as it will appear in the "Actions" tab of your GitHub repository
 name: Publish Docker image
 
-# Déclencheur : ce workflow se lance à chaque 'push' sur la branche 'main'
+# Trigger: This workflow runs on every push to the 'main' branch
 on:
   push:
     branches: ['main']
 
-# Les tâches à exécuter
+# The jobs to run
 jobs:
-  # Nom de la tâche
+  # Name of the job
   push_to_registry:
     name: Push Docker image to Docker Hub
-    # La machine sur laquelle la tâche va tourner (fournie par GitHub)
+    # The machine to run the job on (provided by GitHub)
     runs-on: ubuntu-latest
     
-    # Les étapes de la tâche
+    # The steps of the job
     steps:
-      # 1. Récupère le code de ton dépôt
+      # 1. Checks out your repository's code so the job can access it
       - name: Check out the repo
         uses: actions/checkout@v4
 
-      # 2. Se connecte à Docker Hub en utilisant les secrets
+      # 2. Logs in to Docker Hub using the secrets you configured
       - name: Log in to Docker Hub
         uses: docker/login-action@v3
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
-      # 3. Construit et pousse l'image
+      # 3. Builds the Docker image and pushes it to Docker Hub
       - name: Build and push Docker image
         uses: docker/build-push-action@v5
         with:
-          # Construit à partir du Dockerfile à la racine
+          # The build context (the set of files available to the build) is the project's root directory.
           context: .
-          # Pousse l'image vers le registre Docker Hub
+          # The path to the Dockerfile, relative to the context.
+          file: ./src/Dockerfile
+          # Push the image to the registry after a successful build.
           push: true
-          # Nom et tag de l'image
+          # The name and tag for the image.
           tags: kheopsian/seederr:latest

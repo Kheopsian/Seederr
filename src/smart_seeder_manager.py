@@ -174,7 +174,9 @@ def get_ssd_space_info(cursor):
         total_space = int(MANUAL_SSD_TOTAL_SPACE_GB) * (1024**3)
     else:
         try:
-            total, _ = shutil.disk_usage(SSD_PATH)
+            # --- THIS LINE IS CORRECTED ---
+            # It now correctly unpacks the 3 values returned by disk_usage
+            total, _, _ = shutil.disk_usage(SSD_PATH)
             total_space = total
         except FileNotFoundError:
             logging.error(f"Path '{SSD_PATH}' not found. Cannot determine disk size automatically.")

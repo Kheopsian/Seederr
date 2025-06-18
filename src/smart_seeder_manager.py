@@ -3,11 +3,11 @@
 
 """
 Seederr: Smart Seeder Manager
-Version: 9.5 (Weighted Popularity Scoring)
+Version: 9.7 (Auto-tagging for cached torrents)
 
 This script manages seeding torrents by copying popular torrents from a "master"
-storage array to a fast SSD cache for optimal seeding. Popularity is determined
-by a weighted score based on current demand (leechers) and swarm health.
+storage array to a fast SSD cache for optimal seeding. It now tags cached torrents
+in qBittorrent for easy visibility.
 """
 
 import os
@@ -30,6 +30,7 @@ ARRAY_PATH = os.environ.get('ARRAY_PATH_IN_CONTAINER')
 CHECK_INTERVAL = int(os.environ.get('CHECK_INTERVAL_SECONDS', 3600))
 WEIGHT_LEECHERS = float(os.environ.get('WEIGHT_LEECHERS', 1000.0))
 WEIGHT_SL_RATIO = float(os.environ.get('WEIGHT_SL_RATIO', 200.0))
+SSD_CACHE_TAG = 'ssdCache'
 
 SSD_TARGET_CAPACITY_PERCENT = int(os.environ.get('SSD_TARGET_CAPACITY_PERCENT', 90))
 MAX_MOVES_PER_CYCLE = int(os.environ.get('MAX_MOVES_PER_CYCLE', 1))
@@ -84,8 +85,21 @@ class QBittorrentClient:
         self._request_wrapper('post', url, data=data, timeout=60)
         logging.info(f"Set new save_path for torrent {torrent_hash} to '{new_save_path}'.")
 
+    def add_tags(self, torrent_hash, tags):
+        """Adds tags to a specific torrent."""
+        url = f"{self.base_url}/api/v2/torrents/addTags"
+        data = {'hashes': torrent_hash, 'tags': tags}
+        self._request_wrapper('post', url, data=data, timeout=15)
+        logging.info(f"Added tags '{tags}' to torrent {torrent_hash}.")
+
+    def remove_tags(self, torrent_hash, tags):
+        """Removes tags from a specific torrent."""
+        url = f"{self.base_url}/api/v2/torrents/removeTags"
+        data = {'hashes': torrent_hash, 'tags': tags}
+        self._request_wrapper('post', url, data=data, timeout=15)
+        logging.info(f"Removed tags '{tags}' from torrent {torrent_hash}.")
+
 def db_connect():
-    """Establishes a connection to the PostgreSQL database."""
     while True:
         try:
             conn = psycopg2.connect(dbname=DB_CONFIG['name'], user=DB_CONFIG['user'], password=DB_CONFIG['pass'], host=DB_CONFIG['host'], port=DB_CONFIG['port'])
@@ -96,10 +110,6 @@ def db_connect():
             time.sleep(30)
 
 def setup_database(cursor):
-    """
-    Creates the torrents table with a schema focused purely on current demand.
-    Upload rate columns are removed.
-    """
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS torrents (
             hash VARCHAR(40) PRIMARY KEY,
@@ -107,18 +117,17 @@ def setup_database(cursor):
             size BIGINT,
             save_path TEXT,
             content_path TEXT,
-            master_content_path TEXT, -- The original path on the array
-            location VARCHAR(10),     -- 'ssd' or 'array'
-            added_on BIGINT,          -- Timestamp when added to qBittorrent
-            last_checked BIGINT,      -- Last timestamp this script checked
-            current_leechers INT DEFAULT 0,          -- Current number of leechers (from qBittorrent API)
-            current_seeders INT DEFAULT 0           -- Current number of seeders (from qBittorrent API)
+            master_content_path TEXT,
+            location VARCHAR(10),
+            added_on BIGINT,
+            last_checked BIGINT,
+            current_leechers INT DEFAULT 0,
+            current_seeders INT DEFAULT 0
         );
     """)
-    logging.info("Database schema verification complete for demand-based scoring.")
-    
+
 def promote_torrent(qbit_client, cursor, torrent):
-    """Copies a torrent from the array to the SSD cache and repoints qBittorrent."""
+    """Copies a torrent to the SSD, repoints qBit, and adds the cache tag."""
     source_path = Path(torrent['master_content_path'])
     try:
         relative_path = source_path.relative_to(ARRAY_PATH)
@@ -129,7 +138,7 @@ def promote_torrent(qbit_client, cursor, torrent):
     destination_path = Path(SSD_PATH) / relative_path
 
     if DRY_RUN:
-        logging.info(f"[DRY RUN] PROMOTION: Would copy '{source_path}' to '{destination_path}' and repoint qBit.")
+        logging.info(f"[DRY RUN] PROMOTION: Would copy '{source_path}' to '{destination_path}', repoint qBit, and add tag '{SSD_CACHE_TAG}'.")
         return
 
     try:
@@ -137,14 +146,14 @@ def promote_torrent(qbit_client, cursor, torrent):
         destination_path.parent.mkdir(parents=True, exist_ok=True)
         if source_path.is_dir():
             shutil.copytree(source_path, destination_path, dirs_exist_ok=True)
-        elif source_path.is_file():
-            shutil.copy2(source_path, destination_path)
         else:
-            logging.warning(f"Source path '{source_path}' is not a file or directory. Cannot promote.")
-            return
+            shutil.copy2(source_path, destination_path)
 
         logging.info(f"Copy complete for '{torrent['name']}'. Repointing qBittorrent...")
         qbit_client.set_location(torrent['hash'], str(destination_path))
+        
+        qbit_client.add_tags(torrent['hash'], SSD_CACHE_TAG)
+
         cursor.execute("UPDATE torrents SET location = 'ssd', content_path = %s, save_path = %s WHERE hash = %s", 
                         (str(destination_path), str(destination_path.parent), torrent['hash']))
         logging.info(f"PROMOTION successful for '{torrent['name']}'.")
@@ -152,24 +161,26 @@ def promote_torrent(qbit_client, cursor, torrent):
         logging.error(f"Failed to promote torrent {torrent['hash']}: {e}", exc_info=True)
 
 def relegate_torrent(qbit_client, cursor, torrent):
-    """Repoints qBittorrent to the master file on the array and deletes the cached SSD copy."""
+    """Repoints qBit to the master file, removes cache tag, and deletes the SSD copy."""
     ssd_path_to_delete = Path(torrent['content_path'])
     master_path = Path(torrent['master_content_path'])
     
     if DRY_RUN:
-        logging.info(f"[DRY RUN] RELEGATION: Would repoint qBit to '{master_path}' and delete '{ssd_path_to_delete}'.")
+        logging.info(f"[DRY RUN] RELEGATION: Would repoint qBit to '{master_path}', remove tag '{SSD_CACHE_TAG}', and delete '{ssd_path_to_delete}'.")
         return
 
     try:
         logging.info(f"RELEGATING '{torrent['name']}'. Repointing to master file on array.")
         qbit_client.set_location(torrent['hash'], str(master_path))
-        time.sleep(10) 
+
+        qbit_client.remove_tags(torrent['hash'], SSD_CACHE_TAG)
+
+        time.sleep(10)
         
         logging.info(f"Deleting cached version from SSD: '{ssd_path_to_delete}'")
         if not str(ssd_path_to_delete).startswith(SSD_PATH):
              logging.error(f"SAFETY CHECK FAILED: Path '{ssd_path_to_delete}' is not on the SSD. Aborting delete.")
              return
-
         if ssd_path_to_delete.is_dir():
             shutil.rmtree(ssd_path_to_delete)
         elif ssd_path_to_delete.is_file():
@@ -181,13 +192,12 @@ def relegate_torrent(qbit_client, cursor, torrent):
     except Exception as e:
         logging.error(f"Failed to relegate torrent {torrent['hash']}: {e}", exc_info=True)
 
-
 def main():
-    """Main execution loop using weighted scoring."""
+    """Main execution loop using demand-based scoring (leechers and S/L ratio)."""
     if DRY_RUN:
         logging.warning("="*50); logging.warning("=== SCRIPT IS RUNNING IN DRY RUN MODE ==="); logging.warning("="*50)
     
-    logging.info("Starting Seederr (v9.5 - Weighted Popularity Scoring)")
+    logging.info("Starting Seederr (v9.7 - Auto-tagging for cached torrents)")
     
     qbit_client = QBittorrentClient(QBIT_CONFIG)
     db_conn = db_connect()
@@ -238,17 +248,13 @@ def main():
                         current_timestamp, current_leechers, current_seeders, t['name'], t['hash']
                     ))
                     
-                    # --- REFINED SCORING LOGIC ---
                     if current_leechers > 0:
-                        # Bonus for torrents where leechers outnumber seeders
                         sl_ratio_bonus = (current_leechers / (current_seeders + 1)) * WEIGHT_SL_RATIO
-                        # Main score based on number of active downloaders
                         leechers_score = current_leechers * WEIGHT_LEECHERS
                     else:
                         sl_ratio_bonus = 0
                         leechers_score = 0
                     
-                    # Score is now ONLY based on current demand. If leechers = 0, score = 0.
                     weighted_score = leechers_score + sl_ratio_bonus
 
                     db_entry.update({'weighted_score': weighted_score})
@@ -258,8 +264,7 @@ def main():
                 logging.info("Stats updated and demand scores calculated for all torrents.")
 
                 all_db_torrents.sort(key=lambda x: x['weighted_score'], reverse=True)
-
-                # Rebalancing Logic
+                
                 try:
                     total_ssd_space, _, _ = shutil.disk_usage(SSD_PATH)
                     used_ssd_space = sum(f.stat().st_size for f in Path(SSD_PATH).glob('**/*') if f.is_file())
@@ -269,23 +274,22 @@ def main():
 
                 target_ssd_usage = total_ssd_space * (SSD_TARGET_CAPACITY_PERCENT / 100.0)
                 logging.info(f"SSD Status: {(used_ssd_space / (1024**3)):.2f} GB used / {(total_ssd_space / (1024**3)):.2f} GB total. Target usage: {(target_ssd_usage / (1024**3)):.2f} GB.")
-                
+
                 ideal_ssd_hashes, temp_size = set(), 0
                 for t in all_db_torrents:
-                    if temp_size + t['size'] <= target_ssd_usage:
+                    if t['weighted_score'] > 0 and temp_size + t['size'] <= target_ssd_usage:
                         ideal_ssd_hashes.add(t['hash'])
                         temp_size += t['size']
                     else:
+                        if t['weighted_score'] == 0: continue
                         break
                 
                 current_ssd_hashes = {t['hash'] for t in all_db_torrents if t['location'] == 'ssd'}
                 
                 promotions_to_run = [t for t in all_db_torrents if t['hash'] in (ideal_ssd_hashes - current_ssd_hashes)]
                 relegations_to_run = [t for t in all_db_torrents if t['hash'] in (current_ssd_hashes - ideal_ssd_hashes)]
-                
-                # Sort relegations by score (ascending) to remove the worst torrents first
-                relegations_to_run.sort(key=lambda x: x['weighted_score'])
 
+                relegations_to_run.sort(key=lambda x: x['weighted_score'])
                 logging.info(f"Analysis complete: {len(promotions_to_run)} promotion(s) and {len(relegations_to_run)} relegation(s) identified.")
 
                 moves_done = 0
@@ -305,8 +309,7 @@ def main():
                         logging.warning(f"Skipping promotion of '{torrent['name']}': not enough free space on SSD.")
                 
                 db_conn.commit()
-
-
+                
         except (psycopg2.InterfaceError, psycopg2.OperationalError) as e:
             logging.error(f"Database connection lost: {e}. Attempting to reconnect..."); db_conn.close(); db_conn = db_connect()
         except requests.exceptions.RequestException as e:

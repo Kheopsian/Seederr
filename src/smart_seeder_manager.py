@@ -38,8 +38,12 @@ MAX_MOVES_PER_CYCLE = int(os.environ.get('MAX_MOVES_PER_CYCLE', 1))
 DRY_RUN = os.environ.get('DRY_RUN', 'true').lower() == 'true'
 
 class QBittorrentClient:
-    """Client to interact with the qBittorrent WebUI API."""
+    """Client to interact with the qBittorrent WebUI API, with auto-relogin."""
+
     def __init__(self, config):
+        """
+        Initializes the client and performs the first login.
+        """
         self.base_url = f"http://{config['host']}:{config['port']}"
         self.user = config['user']
         self.password = config['pass']
@@ -48,34 +52,70 @@ class QBittorrentClient:
         self._login()
 
     def _login(self):
+        """
+        Performs authentication against the qBittorrent API.
+        This will be called on init and whenever a session expires.
+        """
         login_url = f"{self.base_url}/api/v2/auth/login"
         login_data = {'username': self.user, 'password': self.password}
         try:
+            # We start with a fresh session state for login, but keep the session object
+            # to preserve any other settings (like proxies, if any were set).
+            # The 'post' will update the session's cookies automatically.
             r = self.session.post(login_url, data=login_data, timeout=10)
             r.raise_for_status()
-            if r.text != "Ok.":
-                raise ConnectionError("qBittorrent login failed: Invalid credentials.")
-            logging.info("Successfully connected to qBittorrent API.")
+            if r.text.strip() != "Ok.":
+                raise ConnectionError("qBittorrent login failed: Invalid credentials or unexpected response.")
+            logging.info("Successfully (re)connected to qBittorrent API.")
         except requests.exceptions.RequestException as e:
-            logging.error(f"Error connecting to qBittorrent API: {e}")
+            logging.error(f"Error connecting to qBittorrent API during login: {e}")
+            raise # Propagate the error if login itself fails
+
+    def _request_wrapper(self, method, url, **kwargs):
+        """
+        A wrapper for all API requests that handles session expiration.
+        It tries the request, and if it fails with a 403 (Forbidden),
+        it attempts to log in again and retries the request once.
+        """
+        try:
+            r = self.session.request(method, url, **kwargs)
+            # A 403 status is a common sign of an expired session cookie
+            if r.status_code == 403:
+                logging.warning("Received 403 Forbidden. Session may have expired. Attempting to re-login.")
+                self._login()
+                # Retry the original request after successful re-login
+                r = self.session.request(method, url, **kwargs)
+            
+            r.raise_for_status() # Raise an exception for any other error (4xx, 5xx)
+            return r
+        except requests.exceptions.RequestException as e:
+            logging.error(f"qBittorrent API request failed for {method} {url}: {e}")
+            # Instead of returning a default value, we raise the exception
+            # to let the main loop handle the connection loss if it persists.
             raise
 
     def get_torrents(self):
+        """
+        Retrieves the list of all torrents from qBittorrent.
+        """
         torrents_url = f"{self.base_url}/api/v2/torrents/info?filter=all&sort=name"
-        try:
-            r = self.session.get(torrents_url, timeout=30)
-            r.raise_for_status()
-            return r.json()
-        except requests.exceptions.RequestException as e:
-            logging.error(f"Could not retrieve torrent list: {e}")
-            return []
+        # We removed the local try/except to let the wrapper handle it
+        response = self._request_wrapper('get', torrents_url, timeout=30)
+        return response.json()
 
     def set_location(self, torrent_hash, new_location):
+        """
+        Sets a new location for a specific torrent.
+        """
         url = f"{self.base_url}/api/v2/torrents/setLocation"
         # The location for qBit is the directory containing the torrent data.
         new_save_path = str(Path(new_location).parent)
-        self.session.post(url, data={'hashes': torrent_hash, 'location': new_save_path}, timeout=60)
+        data = {'hashes': torrent_hash, 'location': new_save_path}
+        
+        # This call is now wrapped, handling potential session issues.
+        self._request_wrapper('post', url, data=data, timeout=60)
         logging.info(f"Set new save_path for torrent {torrent_hash} to '{new_save_path}'.")
+
 
 def db_connect():
     """Establishes a connection to the PostgreSQL database."""

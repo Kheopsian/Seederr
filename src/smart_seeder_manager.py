@@ -197,7 +197,7 @@ def main():
     if DRY_RUN:
         logging.warning("="*50); logging.warning("=== SCRIPT IS RUNNING IN DRY RUN MODE ==="); logging.warning("="*50)
     
-    logging.info("Starting Seederr (v9.8 - Corrected Peer Stats)")
+    logging.info("Starting Seederr (v9.9 - Final Peer Stats Correction)")
     
     qbit_client = QBittorrentClient(QBIT_CONFIG)
     db_conn = db_connect()
@@ -221,8 +221,8 @@ def main():
                     cursor.execute("SELECT * FROM torrents WHERE hash = %s", (t['hash'],))
                     db_entry = cursor.fetchone()
                     
-                    current_leechers = t.get('leechs_total', 0)
-                    current_seeders = t.get('seeds_total', 0)
+                    current_seeders = t.get('num_complete', 0)
+                    current_leechers = t.get('num_incomplete', 0)
 
                     if not db_entry:
                         location = 'ssd' if t['content_path'].startswith(SSD_PATH) else 'array'

@@ -2,40 +2,40 @@ version: '3.8'
 
 services:
   seederr:
-    # The name of the image on Docker Hub
-    image: YOUR_DOCKERHUB_USERNAME/seederr:latest
+    image: kheopsian/seederr:latest
     container_name: seederr
     restart: unless-stopped
     
-    # 🚨 Volume Mapping: This is the most critical part.
-    # The container must see the same parent download folders as qBittorrent, Sonarr, and Radarr.
+    # 🚨 Volume Mapping: Critical for proper function!
     volumes:
-      # Path on the host server | Path INSIDE the container
-      - /mnt/disks/zfs_cache/downloads/hot:/downloads/hot # ⬅️ EDIT THIS HOST PATH
-      - /mnt/user/data/downloads/cold:/downloads/cold    # ⬅️ EDIT THIS HOST PATH
+      # Map your main 'data' share, used by qBit/Sonarr/Radarr
+      - /mnt/user/data:/data                             # ⬅️ EDIT THIS HOST PATH
+      # Map your fast 'cache' drive. MUST ALSO BE MAPPED IN QBITTORRENT.
+      - /mnt/disks/your_ssd/cache:/cache                 # ⬅️ EDIT THIS HOST PATH
       
     environment:
+      # --- User and Group IDs for file permissions ---
+      - PUID=99
+      - PGID=100
+
       # --- Connection Parameters ---
-      - QBIT_HOST=192.168.1.100       # IP address of the Unraid server
+      - QBIT_HOST=192.168.1.100       # IP address of your qBittorrent instance
       - QBIT_PORT=8080                # qBittorrent WebUI Port
-      - QBIT_USER=admin
-      - QBIT_PASS=adminadmin
-      - DB_HOST=192.168.1.100         # IP address of the Unraid server
+      - QBIT_USER=admin               # ⬅️ CHANGE THIS
+      - QBIT_PASS=adminadmin          # ⬅️ CHANGE THIS
+      - DB_HOST=192.168.1.100         # IP address of your PostgreSQL instance
       - DB_PORT=5432                  # PostgreSQL port
       - DB_NAME=torrents_stats
-      - DB_USER= # The database user
-      - DB_PASS= # The password
+      - DB_USER=your_db_user          # ⬅️ CHANGE THIS
+      - DB_PASS=your_db_password      # ⬅️ CHANGE THIS
       
       # --- Paths SEEN BY THE SCRIPT (inside the container) ---
       # These must match the container-side paths in the volume mappings above.
-      - SSD_PATH_IN_CONTAINER=/downloads/hot
-      - ARRAY_PATH_IN_CONTAINER=/downloads/cold
+      - SSD_PATH_IN_CONTAINER=/cache
+      - ARRAY_PATH_IN_CONTAINER=/data/downloads
 
       # --- Logic Parameters ---
-      - CHECK_INTERVAL_SECONDS=3600               # Check interval (3600s = 1 hour)
-      - EMA_ALPHA=0.012                           # Smoothing factor for long-term score
-      - WEIGHT_LONG_TERM=0.8                      # 80% weight for long-term score
-      - WEIGHT_SHORT_TERM=0.2                     # 20% weight for short-term score
-      - SSD_TARGET_CAPACITY_PERCENT=90            # Target fill percentage for the SSD
-      - MAX_MOVES_PER_CYCLE=1                     # Max moves per cycle (set to 1 for production)
-      - DRY_RUN=false                             # ⚠️ Set to 'false' to enable actual moves!
+      - CHECK_INTERVAL_SECONDS=3600
+      - SSD_TARGET_CAPACITY_PERCENT=90
+      - MAX_MOVES_PER_CYCLE=1
+      - DRY_RUN=true                  # ⚠️ Set to 'false' to enable actual operations!

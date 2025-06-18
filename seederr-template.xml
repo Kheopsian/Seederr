@@ -10,7 +10,7 @@
   <Support>https://github.com/Kheopsian/Seederr/issues</Support>
   <Project>https://github.com/Kheopsian/seederr</Project>
   <Overview>
-    Seederr is a smart torrent manager that automatically moves files between fast storage (SSD) and slow storage (Array) based on their seeding performance. It aims to maximize seeding efficiency by keeping the most popular torrents on the SSD.
+    Seederr intelligently manages your torrents by copying popular files from your main data storage to a fast cache (SSD) to maximize seeding. It is designed to work alongside Sonarr/Radarr without breaking hardlinks. Requires qBittorrent and PostgreSQL.
   </Overview>
   <Category>Downloaders</Category>
   <WebUI/>
@@ -23,11 +23,14 @@
   <DonateText/>
   <DonateLink/>
   <Requires>
-    Requires a functional and network-accessible instance of qBittorrent and PostgreSQL.
+    Requires a functional qBittorrent and PostgreSQL. You MUST map the Cache Path into your qBittorrent container as well.
   </Requires>
   
-  <Config Name="SSD Download Path" Target="/downloads/hot" Default="/mnt/disks/your_ssd_pool/downloads/hot" Mode="rw" Description="Path to the 'hot' downloads folder on your SSD." Type="Path" Display="always" Required="true"/>
-  <Config Name="Array Download Path" Target="/downloads/cold" Default="/mnt/user/data/downloads/cold" Mode="rw" Description="Path to the 'cold' downloads folder on your array." Type="Path" Display="always" Required="true"/>
+  <Config Name="Data Path" Target="/data" Default="/mnt/user/data/" Mode="rw" Description="Path to your main data share, which should also be mapped to your other media containers (qBit, Sonarr, Radarr)." Type="Path" Display="always" Required="true"/>
+  <Config Name="Cache Path" Target="/cache" Default="/mnt/disks/your_ssd/cache/" Mode="rw" Description="Path to your fast seeding cache on an SSD. IMPORTANT: This path must also be mapped to your qBittorrent container!" Type="Path" Display="always" Required="true"/>
+  
+  <Config Name="PUID" Target="PUID" Default="99" Description="User ID for file permissions." Type="Variable" Display="advanced" Required="true"/>
+  <Config Name="PGID" Target="PGID" Default="100" Description="Group ID for file permissions." Type="Variable" Display="advanced" Required="true"/>
   
   <Config Name="QBIT_HOST" Target="QBIT_HOST" Default="192.168.1.100" Description="IP address of qBittorrent." Type="Variable" Display="always" Required="true"/>
   <Config Name="QBIT_PORT" Target="QBIT_PORT" Default="8080" Description="qBittorrent WebUI Port." Type="Variable" Display="always" Required="true"/>
@@ -40,15 +43,11 @@
   <Config Name="DB_USER" Target="DB_USER" Default="" Description="Database username." Type="Variable" Display="advanced" Required="true"/>
   <Config Name="DB_PASS" Target="DB_PASS" Default="" Description="Database password." Type="Variable" Display="advanced" Required="true" Mask="true"/>
   
-  <Config Name="SSD_PATH_IN_CONTAINER" Target="SSD_PATH_IN_CONTAINER" Default="/downloads/hot" Description="DO NOT CHANGE: Internal container path for the SSD." Type="Variable" Display="advanced" Required="true"/>
-  <Config Name="ARRAY_PATH_IN_CONTAINER" Target="ARRAY_PATH_IN_CONTAINER" Default="/downloads/cold" Description="DO NOT CHANGE: Internal container path for the Array." Type="Variable" Display="advanced" Required="true"/>
+  <Config Name="SSD_PATH_IN_CONTAINER" Target="SSD_PATH_IN_CONTAINER" Default="/cache" Description="Internal container path for the SSD cache. Should match your Cache Path target." Type="Variable" Display="advanced" Required="true"/>
+  <Config Name="ARRAY_PATH_IN_CONTAINER" Target="ARRAY_PATH_IN_CONTAINER" Default="/data/downloads" Description="Internal container path for the master downloads folder." Type="Variable" Display="advanced" Required="true"/>
   
   <Config Name="CHECK_INTERVAL_SECONDS" Target="CHECK_INTERVAL_SECONDS" Default="3600" Description="Check interval in seconds (3600 = 1h)." Type="Variable" Display="advanced" Required="true"/>
-  <Config Name="SSD_TARGET_CAPACITY_PERCENT" Target="SSD_TARGET_CAPACITY_PERCENT" Default="90" Description="Target fill percentage for the SSD." Type="Variable" Display="advanced" Required="true"/>
-  <Config Name="MAX_MOVES_PER_CYCLE" Target="MAX_MOVES_PER_CYCLE" Default="1" Description="Max number of moves per cycle (-1 for unlimited in Dry Run)." Type="Variable" Display="advanced" Required="true"/>
-  <Config Name="DRY_RUN" Target="DRY_RUN" Default="true" Description="Set to 'false' to enable actual file moves." Type="Variable" Display="always" Required="true"/>
-  
-  <Config Name="WEIGHT_LONG_TERM" Target="WEIGHT_LONG_TERM" Default="0.8" Description="Weight for the long-term score (0.0-1.0)." Type="Variable" Display="advanced" Required="false"/>
-  <Config Name="WEIGHT_SHORT_TERM" Target="WEIGHT_SHORT_TERM" Default="0.2" Description="Weight for the short-term score (0.0-1.0)." Type="Variable" Display="advanced" Required="false"/>
-  <Config Name="EMA_ALPHA" Target="EMA_ALPHA" Default="0.012" Description="Smoothing factor for the long-term moving average (EMA)." Type="Variable" Display="advanced" Required="false"/>
+  <Config Name="SSD_TARGET_CAPACITY_PERCENT" Target="SSD_TARGET_CAPACITY_PERCENT" Default="90" Description="Target fill percentage for the SSD cache." Type="Variable" Display="advanced" Required="true"/>
+  <Config Name="MAX_MOVES_PER_CYCLE" Target="MAX_MOVES_PER_CYCLE" Default="1" Description="Max number of promotions/relegations per cycle." Type="Variable" Display="advanced" Required="true"/>
+  <Config Name="DRY_RUN" Target="DRY_RUN" Default="true" Description="Set to 'false' to enable actual file copy/delete operations." Type="Variable" Display="always" Required="true"/>
 </Container>

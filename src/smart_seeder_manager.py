@@ -197,7 +197,7 @@ def main():
     if DRY_RUN:
         logging.warning("="*50); logging.warning("=== SCRIPT IS RUNNING IN DRY RUN MODE ==="); logging.warning("="*50)
     
-    logging.info("Starting Seederr (v9.7 - Auto-tagging for cached torrents)")
+    logging.info("Starting Seederr (v9.8 - Corrected Peer Stats)")
     
     qbit_client = QBittorrentClient(QBIT_CONFIG)
     db_conn = db_connect()
@@ -221,8 +221,8 @@ def main():
                     cursor.execute("SELECT * FROM torrents WHERE hash = %s", (t['hash'],))
                     db_entry = cursor.fetchone()
                     
-                    current_leechers = t.get('num_leechs', 0)
-                    current_seeders = t.get('num_seeds', 0)
+                    current_leechers = t.get('leechs_total', 0)
+                    current_seeders = t.get('seeds_total', 0)
 
                     if not db_entry:
                         location = 'ssd' if t['content_path'].startswith(SSD_PATH) else 'array'
@@ -309,7 +309,7 @@ def main():
                         logging.warning(f"Skipping promotion of '{torrent['name']}': not enough free space on SSD.")
                 
                 db_conn.commit()
-                
+
         except (psycopg2.InterfaceError, psycopg2.OperationalError) as e:
             logging.error(f"Database connection lost: {e}. Attempting to reconnect..."); db_conn.close(); db_conn = db_connect()
         except requests.exceptions.RequestException as e:

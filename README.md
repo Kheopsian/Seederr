@@ -1,7 +1,11 @@
-# Seederr: A Smart Seeder Manager
+<h1>
+  <img src="https://raw.githubusercontent.com/Kheopsian/Seederr/main/logo.webp" alt="logo" width="40" style="vertical-align: middle;">
+  Seederr: A Smart Torrent Manager
+</h1>
 
-[![Docker Build Status](https://raw.githubusercontent.com/Kheopsian/Seederr/main/logo.webp)](https://hub.docker.com/r/kheopsian/seederr)
-[![Docker Image Size](https://img.shields.io/docker/image-size/kheopsian/seederr)](https://hub.docker.com/r/kheopsian/seederr)
+[![Build Status](https://github.com/Kheopsian/Seederr/actions/workflows/docker-publish.yml/badge.svg)](https://github.com/Kheopsian/Seederr/actions)
+&nbsp;&nbsp;[![Docker Image Size](https://img.shields.io/docker/image-size/kheopsian/seederr)](https://hub.docker.com/r/kheopsian/seederr)
+
 
 Seederr is a Python-based utility, designed to run in a Docker container, that intelligently manages your seeding torrents. It operates on a promotion/relegation model, treating your slow, mass storage as a permanent "master" library and your fast SSD as a "seeding cache".
 

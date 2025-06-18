@@ -9,9 +9,9 @@ services:
     # 🚨 Volume Mapping: Critical for proper function!
     volumes:
       # Map your main 'data' share, used by qBit/Sonarr/Radarr
-      - /mnt/user/data:/data                             # ⬅️ EDIT THIS HOST PATH
+      - /mnt/user/data:/data                  # ⬅️ EDIT THIS HOST PATH
       # Map your fast 'cache' drive. MUST ALSO BE MAPPED IN QBITTORRENT.
-      - /mnt/disks/your_ssd/cache:/cache                 # ⬅️ EDIT THIS HOST PATH
+      - /mnt/disks/your_ssd/cache:/cache        # ⬅️ EDIT THIS HOST PATH
       
     environment:
       # --- User and Group IDs for file permissions ---
@@ -38,4 +38,7 @@ services:
       - CHECK_INTERVAL_SECONDS=3600
       - SSD_TARGET_CAPACITY_PERCENT=90
       - MAX_MOVES_PER_CYCLE=1
-      - DRY_RUN=true                  # ⚠️ Set to 'false' to enable actual operations!
+      - DRY_RUN=true                    # ⚠️ Set to 'false' to enable actual operations!
+      - WEIGHT_LEECHERS=500.0           # Higher value prioritizes torrents with active downloaders
+      - WEIGHT_COMPLETED_PER_HOUR=1000.0  # Higher value prioritizes torrents with frequent full downloads
+      - WEIGHT_SMOOTHED_UPLOAD=0.1      # Lower value reduces impact of single large transfers on popularity

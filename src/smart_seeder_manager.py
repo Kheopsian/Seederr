@@ -3,7 +3,7 @@
 
 """
 Seederr: Smart Seeder Manager
-Version: 9.0 (Copy-based Promotion/Relegation)
+Version: 9.1 (Copy-based Promotion/Relegation with enhanced popularity and cache tracking)
 
 This script manages seeding torrents by copying popular torrents from a "master"
 storage array to a fast SSD cache for optimal seeding. When a torrent is no longer
@@ -31,8 +31,10 @@ SSD_PATH = os.environ.get('SSD_PATH_IN_CONTAINER')
 ARRAY_PATH = os.environ.get('ARRAY_PATH_IN_CONTAINER')
 CHECK_INTERVAL = int(os.environ.get('CHECK_INTERVAL_SECONDS', 3600))
 EMA_ALPHA = float(os.environ.get('EMA_ALPHA', 0.012))
-WEIGHT_LONG_TERM = float(os.environ.get('WEIGHT_LONG_TERM', 0.8))
-WEIGHT_SHORT_TERM = float(os.environ.get('WEIGHT_SHORT_TERM', 0.2))
+WEIGHT_LEECHERS = float(os.environ.get('WEIGHT_LEECHERS', 500.0))
+WEIGHT_COMPLETED_PER_HOUR = float(os.environ.get('WEIGHT_COMPLETED_PER_HOUR', 1000.0))
+WEIGHT_SMOOTHED_UPLOAD = float(os.environ.get('WEIGHT_SMOOTHED_UPLOAD', 0.1))
+
 SSD_TARGET_CAPACITY_PERCENT = int(os.environ.get('SSD_TARGET_CAPACITY_PERCENT', 90))
 MAX_MOVES_PER_CYCLE = int(os.environ.get('MAX_MOVES_PER_CYCLE', 1))
 DRY_RUN = os.environ.get('DRY_RUN', 'true').lower() == 'true'
@@ -98,8 +100,9 @@ class QBittorrentClient:
         """
         Retrieves the list of all torrents from qBittorrent.
         """
+        # Ensure we request all necessary fields from qBittorrent API
+        # 'uploaded', 'completed', 'num_leechs', 'num_seeds' are crucial
         torrents_url = f"{self.base_url}/api/v2/torrents/info?filter=all&sort=name"
-        # We removed the local try/except to let the wrapper handle it
         response = self._request_wrapper('get', torrents_url, timeout=30)
         return response.json()
 
@@ -129,24 +132,60 @@ def db_connect():
             time.sleep(30)
 
 def setup_database(cursor):
-    """Creates and updates the torrents table, adding master_content_path if needed."""
+    """
+    Creates and updates the torrents table.
+    - Adds 'master_content_path' if needed (existing logic).
+    - Adds 'last_completed', 'completed_per_hour', 'smoothed_completed_per_hour',
+      'current_leechers', 'current_seeders' for enhanced popularity tracking.
+    - Adds 'cycles_in_cache' to track how many cycles a torrent has been in the SSD cache.
+    """
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS torrents (
-            hash VARCHAR(40) PRIMARY KEY, name TEXT, size BIGINT, save_path TEXT,
-            content_path TEXT, master_content_path TEXT, location VARCHAR(10),
-            added_on BIGINT, last_checked BIGINT, last_uploaded BIGINT,
-            rate_gb_day REAL DEFAULT 0.0, smoothed_rate_gb_day REAL DEFAULT 0.0
+            hash VARCHAR(40) PRIMARY KEY,
+            name TEXT,
+            size BIGINT,
+            save_path TEXT,
+            content_path TEXT,
+            master_content_path TEXT, -- The original path on the array
+            location VARCHAR(10),     -- 'ssd' or 'array'
+            added_on BIGINT,          -- Timestamp when added to qBittorrent
+            last_checked BIGINT,      -- Last timestamp this script checked
+            last_uploaded BIGINT,     -- Total uploaded bytes from last check
+            rate_gb_day REAL DEFAULT 0.0,            -- Instantaneous upload rate GB/day
+            smoothed_rate_gb_day REAL DEFAULT 0.0,   -- EMA of upload rate GB/day
+
+            -- New columns for enhanced popularity
+            last_completed BIGINT DEFAULT 0,         -- Total completed count from last check
+            completed_per_hour REAL DEFAULT 0.0,     -- Instantaneous completed rate per hour
+            smoothed_completed_per_hour REAL DEFAULT 0.0, -- EMA of completed rate per hour
+            current_leechers INT DEFAULT 0,          -- Current number of leechers (from qBittorrent API)
+            current_seeders INT DEFAULT 0,           -- Current number of seeders (from qBittorrent API)
+
+            -- New column for tracking cache residency
+            cycles_in_cache INT DEFAULT 0            -- Number of consecutive cycles in SSD cache
         );
     """)
-    cursor.execute("""
-        DO $$
-        BEGIN
-            IF NOT EXISTS(SELECT 1 FROM information_schema.columns WHERE table_name='torrents' and column_name='master_content_path') THEN
-                ALTER TABLE torrents ADD COLUMN master_content_path TEXT;
-            END IF;
-        END $$;
-    """)
-    logging.info("Database schema verification complete.")
+    
+    columns_to_add = {
+        'master_content_path': 'TEXT',
+        'last_completed': 'BIGINT DEFAULT 0',
+        'completed_per_hour': 'REAL DEFAULT 0.0',
+        'smoothed_completed_per_hour': 'REAL DEFAULT 0.0',
+        'current_leechers': 'INT DEFAULT 0',
+        'current_seeders': 'INT DEFAULT 0',
+        'cycles_in_cache': 'INT DEFAULT 0'
+    }
+
+    for column, definition in columns_to_add.items():
+        cursor.execute(f"""
+            DO $$
+            BEGIN
+                IF NOT EXISTS(SELECT 1 FROM information_schema.columns WHERE table_name='torrents' AND column_name='{column}') THEN
+                    ALTER TABLE torrents ADD COLUMN {column} {definition};
+                END IF;
+            END $$;
+        """)
+    logging.info("Database schema verification complete. All necessary columns are ensured.")
 
 def promote_torrent(qbit_client, cursor, torrent):
     """Copies a torrent from the array to the SSD cache and repoints qBittorrent."""
@@ -181,7 +220,7 @@ def promote_torrent(qbit_client, cursor, torrent):
         qbit_client.set_location(torrent['hash'], str(destination_path))
         
         cursor.execute("UPDATE torrents SET location = 'ssd', content_path = %s, save_path = %s WHERE hash = %s", 
-                       (str(destination_path), str(destination_path.parent), torrent['hash']))
+                        (str(destination_path), str(destination_path.parent), torrent['hash']))
         logging.info(f"PROMOTION successful for '{torrent['name']}'.")
     except Exception as e:
         logging.error(f"Failed to promote torrent {torrent['hash']}: {e}", exc_info=True)
@@ -215,7 +254,7 @@ def relegate_torrent(qbit_client, cursor, torrent):
             ssd_path_to_delete.unlink()
         
         cursor.execute("UPDATE torrents SET location = 'array', content_path = %s, save_path = %s WHERE hash = %s", 
-                       (str(master_path), str(master_path.parent), torrent['hash']))
+                        (str(master_path), str(master_path.parent), torrent['hash']))
         logging.info(f"RELEGATION successful for '{torrent['name']}'.")
     except Exception as e:
         logging.error(f"Failed to relegate torrent {torrent['hash']}: {e}", exc_info=True)
@@ -226,7 +265,7 @@ def main():
     if DRY_RUN:
         logging.warning("="*50); logging.warning("=== SCRIPT IS RUNNING IN DRY RUN MODE ==="); logging.warning("="*50)
     
-    logging.info("Starting Seederr (v9.0 - Copy-based Promotion)")
+    logging.info("Starting Seederr (v9.1 - Copy-based Promotion with enhanced popularity)")
     
     qbit_client = QBittorrentClient(QBIT_CONFIG)
     db_conn = db_connect()
@@ -249,26 +288,63 @@ def main():
                     cursor.execute("SELECT * FROM torrents WHERE hash = %s", (t['hash'],))
                     db_entry = cursor.fetchone()
                     
+                    # Get new values from qBittorrent API
+                    current_uploaded = t['uploaded']
+                    current_completed = t['completed']
+                    current_leechers = t['num_leechs']
+                    current_seeders = t['num_seeds']
+
                     if not db_entry:
                         # First time seeing this torrent. Its current location IS the master location.
                         location = 'ssd' if t['content_path'].startswith(SSD_PATH) else 'array'
                         logging.info(f"New torrent '{t['name']}' found. Setting master path to '{t['content_path']}' and location to '{location}'.")
                         cursor.execute("""
-                            INSERT INTO torrents (hash, name, size, save_path, content_path, master_content_path, location, added_on, last_checked, last_uploaded, rate_gb_day, smoothed_rate_gb_day)
-                            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-                        """, (t['hash'], t['name'], t['size'], t['save_path'], t['content_path'], t['content_path'], location, t['added_on'], current_timestamp, t['uploaded'], 0.0, 0.0))
+                            INSERT INTO torrents (
+                                hash, name, size, save_path, content_path, master_content_path, location, added_on, 
+                                last_checked, last_uploaded, rate_gb_day, smoothed_rate_gb_day, 
+                                last_completed, completed_per_hour, smoothed_completed_per_hour, 
+                                current_leechers, current_seeders, cycles_in_cache
+                            )
+                            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                        """, (
+                            t['hash'], t['name'], t['size'], t['save_path'], t['content_path'], t['content_path'], 
+                            location, t['added_on'], current_timestamp, current_uploaded, 0.0, 0.0, 
+                            current_completed, 0.0, 0.0, current_leechers, current_seeders, 0 if location == 'array' else 1
+                        ))
                     else:
                         delta_time = current_timestamp - db_entry['last_checked']
+                        
+                        # Calculate instant upload rate (existing)
                         instant_rate_gb_day = db_entry['rate_gb_day']
                         if delta_time > 0:
-                            delta_upload = t['uploaded'] - db_entry['last_uploaded']
+                            delta_upload = current_uploaded - db_entry['last_uploaded']
                             instant_rate_gb_day = (delta_upload / delta_time) * 86400 / (1024**3)
                         
-                        old_smoothed_rate = db_entry.get('smoothed_rate_gb_day') or 0.0
-                        new_smoothed_rate = (instant_rate_gb_day * EMA_ALPHA) + (old_smoothed_rate * (1 - EMA_ALPHA))
+                        old_smoothed_upload_rate = db_entry.get('smoothed_rate_gb_day') or 0.0
+                        new_smoothed_upload_rate = (instant_rate_gb_day * EMA_ALPHA) + (old_smoothed_upload_rate * (1 - EMA_ALPHA))
+
+                        # Calculate instant completed rate
+                        instant_completed_per_hour = db_entry['completed_per_hour']
+                        if delta_time > 0:
+                            delta_completed = current_completed - db_entry['last_completed']
+                            # Convert to completed per hour
+                            instant_completed_per_hour = delta_completed / (delta_time / 3600.0) 
                         
-                        cursor.execute("UPDATE torrents SET last_checked = %s, last_uploaded = %s, rate_gb_day = %s, smoothed_rate_gb_day = %s, name = %s WHERE hash = %s",
-                                       (current_timestamp, t['uploaded'], instant_rate_gb_day, new_smoothed_rate, t['name'], t['hash']))
+                        old_smoothed_completed_per_hour = db_entry.get('smoothed_completed_per_hour') or 0.0
+                        new_smoothed_completed_per_hour = (instant_completed_per_hour * EMA_ALPHA) + (old_smoothed_completed_per_hour * (1 - EMA_ALPHA))
+                        
+                        # Update DB
+                        cursor.execute("""
+                            UPDATE torrents SET 
+                                last_checked = %s, last_uploaded = %s, rate_gb_day = %s, smoothed_rate_gb_day = %s, 
+                                last_completed = %s, completed_per_hour = %s, smoothed_completed_per_hour = %s, 
+                                current_leechers = %s, current_seeders = %s, name = %s 
+                            WHERE hash = %s
+                        """, (
+                            current_timestamp, current_uploaded, instant_rate_gb_day, new_smoothed_upload_rate, 
+                            current_completed, instant_completed_per_hour, new_smoothed_completed_per_hour,
+                            current_leechers, current_seeders, t['name'], t['hash']
+                        ))
                 
                 db_conn.commit()
                 logging.info("Performance stats updated for all torrents.")
@@ -284,33 +360,69 @@ def main():
                 target_ssd_usage = total_ssd_space * (SSD_TARGET_CAPACITY_PERCENT / 100.0)
                 logging.info(f"SSD Status: {(used_ssd_space / (1024**3)):.2f} GB used / {(total_ssd_space / (1024**3)):.2f} GB total. Target usage: {(target_ssd_usage / (1024**3)):.2f} GB.")
 
-                cursor.execute("SELECT *, (smoothed_rate_gb_day::double precision * %s + rate_gb_day::double precision * %s) as weighted_score FROM torrents ORDER BY weighted_score DESC", (WEIGHT_LONG_TERM, WEIGHT_SHORT_TERM))
+                cursor.execute("""
+                    SELECT *, 
+                           (current_leechers::double precision * %s + 
+                            smoothed_completed_per_hour::double precision * %s +
+                            smoothed_rate_gb_day::double precision * %s
+                           ) as weighted_score 
+                    FROM torrents 
+                    ORDER BY weighted_score DESC
+                """, (WEIGHT_LEECHERS, WEIGHT_COMPLETED_PER_HOUR, WEIGHT_SMOOTHED_UPLOAD))
+
                 all_db_torrents = cursor.fetchall()
                 
                 ideal_ssd_hashes, temp_size = set(), 0
                 for t in all_db_torrents:
                     if temp_size + t['size'] <= target_ssd_usage:
-                        ideal_ssd_hashes.add(t['hash']); temp_size += t['size']
-                    else: break
+                        ideal_ssd_hashes.add(t['hash'])
+                        temp_size += t['size']
+                    else:
+                        break
                 
                 current_ssd_hashes = {t['hash'] for t in all_db_torrents if t['location'] == 'ssd'}
                 
                 promotions_to_run = [t for t in all_db_torrents if t['hash'] in (ideal_ssd_hashes - current_ssd_hashes)]
                 relegations_to_run = [t for t in all_db_torrents if t['hash'] in (current_ssd_hashes - ideal_ssd_hashes)]
-                
+
                 logging.info(f"Analysis complete: {len(promotions_to_run)} promotion(s) and {len(relegations_to_run)} relegation(s) identified.")
+
+                # 1. Increment for torrents that are currently on SSD and remain there (ideal or not yet relegated)
+                for t in all_db_torrents:
+                    if t['location'] == 'ssd' and t['hash'] in ideal_ssd_hashes:
+                        # Torrent is on SSD and is ideally on SSD -> increment cycles_in_cache
+                        cursor.execute("UPDATE torrents SET cycles_in_cache = cycles_in_cache + 1 WHERE hash = %s", (t['hash'],))
+                    elif t['location'] == 'ssd' and t['hash'] not in ideal_ssd_hashes and t['hash'] not in {r['hash'] for r in relegations_to_run}:
+                        # Torrent is on SSD, is NOT ideally on SSD, but also NOT marked for relegation in this cycle.
+                        # It's still effectively "in cache" for this cycle.
+                        cursor.execute("UPDATE torrents SET cycles_in_cache = cycles_in_cache + 1 WHERE hash = %s", (t['hash'],))
+                    elif t['location'] == 'array' and t['hash'] not in ideal_ssd_hashes:
+                        # Torrent is on array and is ideally on array -> ensure cycles_in_cache is 0
+                        # This handles cases where it might have been relegated manually or missed by a previous cycle
+                        if t['cycles_in_cache'] != 0:
+                            cursor.execute("UPDATE torrents SET cycles_in_cache = 0 WHERE hash = %s", (t['hash'],))
+                    # Torrents being promoted will have their cycles_in_cache set to 1 in promote_torrent
+                    # Torrents being relegated will have their cycles_in_cache set to 0 in relegate_torrent
+                db_conn.commit() # Commit the cycles_in_cache increments before actual moves
+
 
                 moves_done = 0
                 for torrent in sorted(relegations_to_run, key=lambda x: x['weighted_score']):
                     if moves_done >= MAX_MOVES_PER_CYCLE: break
-                    relegate_torrent(qbit_client, cursor, torrent); moves_done += 1
+                    relegate_torrent(qbit_client, cursor, torrent)
+                    # Set cycles_in_cache to 0 when a torrent is relegated
+                    cursor.execute("UPDATE torrents SET cycles_in_cache = 0 WHERE hash = %s", (torrent['hash'],))
+                    moves_done += 1
                 
-                current_used_space = sum(f.stat().st_size for f in Path(SSD_PATH).glob('**/*') if f.is_file())
+                current_used_space = sum(f.stat().st_size for f in Path(SSD_PATH).glob('**/*') if f.is_file()) # Recalculate after relegations
                 for torrent in sorted(promotions_to_run, key=lambda x: x['weighted_score'], reverse=True):
                     if moves_done >= MAX_MOVES_PER_CYCLE: break
                     if current_used_space + torrent['size'] <= total_ssd_space:
-                        promote_torrent(qbit_client, cursor, torrent); moves_done += 1
+                        promote_torrent(qbit_client, cursor, torrent)
+                        # Set cycles_in_cache to 1 when a torrent is promoted for the first time or re-promoted
+                        cursor.execute("UPDATE torrents SET cycles_in_cache = 1 WHERE hash = %s", (torrent['hash'],))
                         current_used_space += torrent['size']
+                        moves_done += 1
                     else:
                         logging.warning(f"Skipping promotion of '{torrent['name']}': not enough free space on SSD.")
                 
@@ -328,8 +440,9 @@ def main():
 
 if __name__ == "__main__":
     required_vars = ['QBIT_HOST', 'QBIT_PORT', 'QBIT_USER', 'QBIT_PASS', 'DB_HOST', 'DB_PORT', 'DB_NAME', 'DB_USER', 'DB_PASS', 'SSD_PATH_IN_CONTAINER', 'ARRAY_PATH_IN_CONTAINER']
+    required_vars.extend(['WEIGHT_LEECHERS', 'WEIGHT_COMPLETED_PER_HOUR', 'WEIGHT_SMOOTHED_UPLOAD']) 
     missing_vars = [var for var in required_vars if not os.environ.get(var)]
     if missing_vars:
         logging.critical(f"Critical environment variables are missing: {', '.join(missing_vars)}. Exiting.")
     else:
-        main()
+        main()                                                                                                                                  

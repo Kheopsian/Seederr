@@ -10,7 +10,7 @@
   <Support>https://github.com/Kheopsian/Seederr/issues</Support>
   <Project>https://github.com/Kheopsian/seederr</Project>
   <Overview>
-    Seederr intelligently manages your torrents by copying popular files from your main data storage to a fast cache (SSD) to maximize seeding. It is designed to work alongside Sonarr/Radarr without breaking hardlinks. Requires qBittorrent and PostgreSQL.
+    Seederr intelligently manages your torrents by copying popular files from your main data storage to a fast cache (SSD) to maximize seeding. It is designed to work alongside Sonarr/Radarr without breaking hardlinks. Requires qBittorrent and PostgreSQL. Now features enhanced popularity scoring based on demand and cache residency tracking.
   </Overview>
   <Category>Downloaders</Category>
   <WebUI/>
@@ -50,4 +50,8 @@
   <Config Name="SSD_TARGET_CAPACITY_PERCENT" Target="SSD_TARGET_CAPACITY_PERCENT" Default="90" Description="Target fill percentage for the SSD cache." Type="Variable" Display="advanced" Required="true"/>
   <Config Name="MAX_MOVES_PER_CYCLE" Target="MAX_MOVES_PER_CYCLE" Default="1" Description="Max number of promotions/relegations per cycle." Type="Variable" Display="advanced" Required="true"/>
   <Config Name="DRY_RUN" Target="DRY_RUN" Default="true" Description="Set to 'false' to enable actual file copy/delete operations." Type="Variable" Display="always" Required="true"/>
+
+  <Config Name="WEIGHT_LEECHERS" Target="WEIGHT_LEECHERS" Default="500.0" Description="Weight for the current number of leechers in the popularity score. Higher value means more priority for torrents with active downloaders." Type="Variable" Display="always" Required="true"/>
+  <Config Name="WEIGHT_COMPLETED_PER_HOUR" Target="WEIGHT_COMPLETED_PER_HOUR" Default="1000.0" Description="Weight for the smoothed rate of completed downloads per hour in the popularity score. Higher value prioritizes torrents with frequent full downloads." Type="Variable" Display="always" Required="true"/>
+  <Config Name="WEIGHT_SMOOTHED_UPLOAD" Target="WEIGHT_SMOOTHED_UPLOAD" Default="0.1" Description="Weight for the smoothed upload rate (GB/day) in the popularity score. A lower value here reduces the impact of single large transfers on popularity." Type="Variable" Display="always" Required="true"/>
 </Container>

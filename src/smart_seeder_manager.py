@@ -28,10 +28,8 @@ DB_CONFIG = { "host": os.environ.get('DB_HOST'), "port": os.environ.get('DB_PORT
 SSD_PATH = os.environ.get('SSD_PATH_IN_CONTAINER')
 ARRAY_PATH = os.environ.get('ARRAY_PATH_IN_CONTAINER')
 CHECK_INTERVAL = int(os.environ.get('CHECK_INTERVAL_SECONDS', 3600))
-EMA_ALPHA = float(os.environ.get('EMA_ALPHA', 0.012))
 WEIGHT_LEECHERS = float(os.environ.get('WEIGHT_LEECHERS', 1000.0))
 WEIGHT_SL_RATIO = float(os.environ.get('WEIGHT_SL_RATIO', 200.0))
-WEIGHT_SMOOTHED_UPLOAD = float(os.environ.get('WEIGHT_SMOOTHED_UPLOAD', 50.0))
 
 SSD_TARGET_CAPACITY_PERCENT = int(os.environ.get('SSD_TARGET_CAPACITY_PERCENT', 90))
 MAX_MOVES_PER_CYCLE = int(os.environ.get('MAX_MOVES_PER_CYCLE', 1))
@@ -321,7 +319,7 @@ def main():
 
 if __name__ == "__main__":
     required_vars = ['QBIT_HOST', 'QBIT_PORT', 'QBIT_USER', 'QBIT_PASS', 'DB_HOST', 'DB_PORT', 'DB_NAME', 'DB_USER', 'DB_PASS', 'SSD_PATH_IN_CONTAINER', 'ARRAY_PATH_IN_CONTAINER']
-    required_vars.extend(['WEIGHT_LEECHERS', 'WEIGHT_SL_RATIO', 'WEIGHT_SMOOTHED_UPLOAD']) 
+    required_vars.extend(['WEIGHT_LEECHERS', 'WEIGHT_SL_RATIO']) 
     missing_vars = [var for var in required_vars if not os.environ.get(var)]
     if missing_vars:
         logging.critical(f"Critical environment variables are missing: {', '.join(missing_vars)}. Exiting.")

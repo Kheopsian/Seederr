@@ -30,7 +30,6 @@ services:
       - DB_PASS=your_db_password      # ⬅️ CHANGE THIS
       
       # --- Paths SEEN BY THE SCRIPT (inside the container) ---
-      # These must match the container-side paths in the volume mappings above.
       - SSD_PATH_IN_CONTAINER=/cache
       - ARRAY_PATH_IN_CONTAINER=/data/downloads
 
@@ -39,6 +38,7 @@ services:
       - SSD_TARGET_CAPACITY_PERCENT=90
       - MAX_MOVES_PER_CYCLE=1
       - DRY_RUN=true                    # ⚠️ Set to 'false' to enable actual operations!
-      - WEIGHT_LEECHERS=500.0           # Higher value prioritizes torrents with active downloaders
-      - WEIGHT_COMPLETED_PER_HOUR=1000.0  # Higher value prioritizes torrents with frequent full downloads
-      - WEIGHT_SMOOTHED_UPLOAD=0.1      # Lower value reduces impact of single large transfers on popularity
+
+      # --- Scoring Weights ---
+      - WEIGHT_LEECHERS=1000.0          # Prioritizes torrents with active downloaders.
+      - WEIGHT_SL_RATIO=200.0           # Adds a bonus for torrents where seeders are needed.

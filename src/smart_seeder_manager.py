@@ -78,10 +78,10 @@ class QBittorrentClient:
         response = self._request_wrapper('get', torrents_url, timeout=30)
         return response.json()
 
-    def set_location(self, torrent_hash, new_location):
+    def set_location(self, torrent_hash, new_save_path):
+        """Sets a new location for a specific torrent."""
         url = f"{self.base_url}/api/v2/torrents/setLocation"
-        new_save_path = str(Path(new_location).parent)
-        data = {'hashes': torrent_hash, 'location': new_save_path}
+        data = {'hashes': torrent_hash, 'location': str(new_save_path)}
         self._request_wrapper('post', url, data=data, timeout=60)
         logging.info(f"Set new save_path for torrent {torrent_hash} to '{new_save_path}'.")
 
@@ -118,6 +118,7 @@ def setup_database(cursor):
             save_path TEXT,
             content_path TEXT,
             master_content_path TEXT,
+            master_save_path TEXT,
             location VARCHAR(10),
             added_on BIGINT,
             last_checked BIGINT,
@@ -130,64 +131,65 @@ def promote_torrent(qbit_client, cursor, torrent):
     """Copies a torrent to the SSD, repoints qBit, and adds the cache tag."""
     source_path = Path(torrent['master_content_path'])
     try:
-        relative_path = source_path.relative_to(ARRAY_PATH)
+        relative_path = source_path.relative_to(Path(torrent['master_content_path']).parent)
     except ValueError:
-        logging.error(f"Cannot calculate relative path for '{source_path}'. It does not appear to be inside '{ARRAY_PATH}'. Skipping promotion.")
+        logging.error(f"Cannot calculate relative path for '{source_path}'. Skipping promotion.")
         return
         
-    destination_path = Path(SSD_PATH) / relative_path
+    destination_content_path = Path(SSD_PATH) / relative_path
+    # The new save path is the parent of the new content path
+    destination_save_path = destination_content_path.parent
 
     if DRY_RUN:
-        logging.info(f"[DRY RUN] PROMOTION: Would copy '{source_path}' to '{destination_path}', repoint qBit, and add tag '{SSD_CACHE_TAG}'.")
+        logging.info(f"[DRY RUN] PROMOTION: Would copy to '{destination_content_path}', set save_path to '{destination_save_path}', and add tag.")
         return
 
     try:
         logging.info(f"PROMOTING '{torrent['name']}' by copying to SSD cache...")
-        destination_path.parent.mkdir(parents=True, exist_ok=True)
+        destination_save_path.mkdir(parents=True, exist_ok=True)
         if source_path.is_dir():
-            shutil.copytree(source_path, destination_path, dirs_exist_ok=True)
+            shutil.copytree(source_path, destination_content_path, dirs_exist_ok=True)
         else:
-            shutil.copy2(source_path, destination_path)
+            shutil.copy2(source_path, destination_content_path)
 
-        logging.info(f"Copy complete for '{torrent['name']}'. Repointing qBittorrent...")
-        qbit_client.set_location(torrent['hash'], str(destination_path))
-        
+        logging.info(f"Copy complete. Repointing qBittorrent to new save_path: {destination_save_path}")
+        qbit_client.set_location(torrent['hash'], str(destination_save_path))
         qbit_client.add_tags(torrent['hash'], SSD_CACHE_TAG)
 
         cursor.execute("UPDATE torrents SET location = 'ssd', content_path = %s, save_path = %s WHERE hash = %s", 
-                        (str(destination_path), str(destination_path.parent), torrent['hash']))
+                        (str(destination_content_path), str(destination_save_path), torrent['hash']))
         logging.info(f"PROMOTION successful for '{torrent['name']}'.")
     except Exception as e:
         logging.error(f"Failed to promote torrent {torrent['hash']}: {e}", exc_info=True)
 
 def relegate_torrent(qbit_client, cursor, torrent):
-    """Repoints qBit to the master file, removes cache tag, and deletes the SSD copy."""
-    ssd_path_to_delete = Path(torrent['content_path'])
-    master_path = Path(torrent['master_content_path'])
+    """Repoints qBit to the master save_path, removes cache tag, and deletes the SSD copy."""
+    ssd_content_path = Path(torrent['content_path'])
+    master_save_path = torrent['master_save_path']
+    master_content_path = torrent['master_content_path']
     
     if DRY_RUN:
-        logging.info(f"[DRY RUN] RELEGATION: Would repoint qBit to '{master_path}', remove tag '{SSD_CACHE_TAG}', and delete '{ssd_path_to_delete}'.")
+        logging.info(f"[DRY RUN] RELEGATION: Would set save_path to '{master_save_path}', remove tag, and delete '{ssd_content_path}'.")
         return
 
     try:
-        logging.info(f"RELEGATING '{torrent['name']}'. Repointing to master file on array.")
-        qbit_client.set_location(torrent['hash'], str(master_path))
-
+        logging.info(f"RELEGATING '{torrent['name']}'. Repointing to master save_path: {master_save_path}")
+        qbit_client.set_location(torrent['hash'], master_save_path)
         qbit_client.remove_tags(torrent['hash'], SSD_CACHE_TAG)
 
-        time.sleep(10)
+        time.sleep(10) 
         
-        logging.info(f"Deleting cached version from SSD: '{ssd_path_to_delete}'")
-        if not str(ssd_path_to_delete).startswith(SSD_PATH):
-             logging.error(f"SAFETY CHECK FAILED: Path '{ssd_path_to_delete}' is not on the SSD. Aborting delete.")
+        logging.info(f"Deleting cached version from SSD: '{ssd_content_path}'")
+        if not str(ssd_content_path).startswith(SSD_PATH):
+             logging.error(f"SAFETY CHECK FAILED: Path '{ssd_content_path}' is not on the SSD. Aborting delete.")
              return
-        if ssd_path_to_delete.is_dir():
-            shutil.rmtree(ssd_path_to_delete)
-        elif ssd_path_to_delete.is_file():
-            ssd_path_to_delete.unlink()
+        if ssd_content_path.is_dir():
+            shutil.rmtree(ssd_content_path)
+        elif ssd_content_path.is_file():
+            ssd_content_path.unlink()
         
         cursor.execute("UPDATE torrents SET location = 'array', content_path = %s, save_path = %s WHERE hash = %s", 
-                        (str(master_path), str(master_path.parent), torrent['hash']))
+                        (master_content_path, master_save_path, torrent['hash']))
         logging.info(f"RELEGATION successful for '{torrent['name']}'.")
     except Exception as e:
         logging.error(f"Failed to relegate torrent {torrent['hash']}: {e}", exc_info=True)
@@ -228,12 +230,12 @@ def main():
                         location = 'ssd' if t['content_path'].startswith(SSD_PATH) else 'array'
                         cursor.execute("""
                             INSERT INTO torrents (
-                                hash, name, size, save_path, content_path, master_content_path, location, added_on, 
-                                last_checked, current_leechers, current_seeders
+                                hash, name, size, save_path, content_path, master_content_path, master_save_path,
+                                location, added_on, last_checked, current_leechers, current_seeders
                             )
-                            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                         """, (
-                            t['hash'], t['name'], t['size'], t['save_path'], t['content_path'], t['content_path'], 
+                            t['hash'], t['name'], t['size'], t['save_path'], t['content_path'], t['content_path'], t['save_path'],
                             location, t['added_on'], current_timestamp, current_leechers, current_seeders
                         ))
                         db_conn.commit()

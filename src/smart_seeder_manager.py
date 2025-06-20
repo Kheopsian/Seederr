@@ -99,6 +99,17 @@ class QBittorrentClient:
         self._request_wrapper('post', url, data=data, timeout=15)
         logging.info(f"Removed tags '{tags}' from torrent {torrent_hash}.")
 
+def connect_to_qbit(config, interval):
+    while True:
+        try:
+            logging.info("Attempting to connect to the qBittorrent API...")
+            client = QBittorrentClient(config)
+            # Si la ligne ci-dessus réussit, la connexion est établie.
+            return client
+        except (requests.exceptions.RequestException, ConnectionError) as e:
+            logging.error(f"Failed to connect to qBittorrent: {e}. Retrying in {interval / 3600:.1f} hour(s).")
+            time.sleep(interval)
+
 def db_connect():
     while True:
         try:
@@ -201,7 +212,7 @@ def main():
     
     logging.info("Starting Seederr (v9.9 - Final Peer Stats Correction)")
     
-    qbit_client = QBittorrentClient(QBIT_CONFIG)
+    qbit_client = connect_to_qbit(QBIT_CONFIG, CHECK_INTERVAL)
     db_conn = db_connect()
 
     with db_conn.cursor() as cursor:

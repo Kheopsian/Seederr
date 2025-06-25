@@ -224,6 +224,7 @@ def main():
             logging.info("--- Starting new verification cycle ---")
             
             with db_conn.cursor(cursor_factory=RealDictCursor) as cursor:
+                # This is the line that can fail and trigger the exception
                 api_torrents = qbit_client.get_torrents()
                 logging.info(f"Retrieved {len(api_torrents)} torrents from qBittorrent for processing.")
                 current_timestamp = int(time.time())
@@ -324,9 +325,21 @@ def main():
                 db_conn.commit()
 
         except (psycopg2.InterfaceError, psycopg2.OperationalError) as e:
-            logging.error(f"Database connection lost: {e}. Attempting to reconnect..."); db_conn.close(); db_conn = db_connect()
+            logging.error(f"Database connection lost: {e}. Attempting to reconnect..."); 
+            db_conn.close(); 
+            db_conn = db_connect()
+        
         except requests.exceptions.RequestException as e:
-            logging.error(f"Connection to qBittorrent lost: {e}. Attempting to reconnect..."); qbit_client = QBittorrentClient(QBIT_CONFIG)
+            logging.error(f"Connection to qBittorrent lost during cycle: {e}. Attempting to create a new connection for the next cycle.")
+            # This logic prevents the crash.
+            # We try to create a new client. If it fails, we catch the exception and log it.
+            # The script will then wait for CHECK_INTERVAL before trying again in the next loop iteration.
+            try:
+                qbit_client = QBittorrentClient(QBIT_CONFIG)
+                logging.info("New qBittorrent client created successfully.")
+            except (requests.exceptions.RequestException, ConnectionError) as e_recon:
+                logging.error(f"Failed to create new qBittorrent client immediately: {e_recon}. Will retry in the next cycle.")
+        
         except Exception as e:
             logging.critical(f"An unhandled critical error occurred: {e}", exc_info=True); time.sleep(300)
 

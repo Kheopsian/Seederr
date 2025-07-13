@@ -3,11 +3,11 @@
 
 """
 Seederr: Smart Seeder Manager
-Version: 9.7 (Auto-tagging for cached torrents)
+Version: 9.8 (Performance Tracking)
 
 This script manages seeding torrents by copying popular torrents from a "master"
 storage array to a fast SSD cache for optimal seeding. It now tags cached torrents
-in qBittorrent for easy visibility.
+in qBittorrent, and tracks cache hit/miss performance.
 """
 
 import os
@@ -18,6 +18,8 @@ import logging
 import shutil
 from pathlib import Path
 from psycopg2.extras import RealDictCursor
+from datetime import timedelta
+
 
 # --- Configuration ---
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s', datefmt='%Y-%m-%d %H:%M:%S')
@@ -104,7 +106,6 @@ def connect_to_qbit(config, interval):
         try:
             logging.info("Attempting to connect to the qBittorrent API...")
             client = QBittorrentClient(config)
-            # Si la ligne ci-dessus réussit, la connexion est établie.
             return client
         except (requests.exceptions.RequestException, ConnectionError) as e:
             logging.error(f"Failed to connect to qBittorrent: {e}. Retrying in {interval / 3600:.1f} hour(s).")
@@ -148,7 +149,6 @@ def promote_torrent(qbit_client, cursor, torrent):
         return
         
     destination_content_path = Path(SSD_PATH) / relative_path
-    # The new save path is the parent of the new content path
     destination_save_path = destination_content_path.parent
 
     if DRY_RUN:
@@ -205,12 +205,33 @@ def relegate_torrent(qbit_client, cursor, torrent):
     except Exception as e:
         logging.error(f"Failed to relegate torrent {torrent['hash']}: {e}", exc_info=True)
 
+def print_performance_report(hits, misses, start_time):
+    """Displays a performance and uptime report."""
+    uptime_seconds = time.time() - start_time
+    uptime_str = str(timedelta(seconds=int(uptime_seconds)))
+
+    print("\n" + "="*80)
+    print(f"PERFORMANCE & STATUS REPORT")
+    print(f"Total Uptime: {uptime_str}")
+    print("-"*80)
+    
+    print(f"  ✅ Cache Hits: {hits:,}")
+    print(f"  ❌ Cache Misses: {misses:,}")
+    
+    total_requests = hits + misses
+    if total_requests > 0:
+        cache_hit_rate = (hits / total_requests) * 100
+        print(f"  => Cache Hit Rate: {cache_hit_rate:.2f}%")
+    else:
+        print("  => Cache Hit Rate: N/A (no leecher requests recorded yet)")
+    print("="*80 + "\n")
+
 def main():
     """Main execution loop using demand-based scoring (leechers and S/L ratio)."""
     if DRY_RUN:
         logging.warning("="*50); logging.warning("=== SCRIPT IS RUNNING IN DRY RUN MODE ==="); logging.warning("="*50)
     
-    logging.info("Starting Seederr (v9.9 - Final Peer Stats Correction)")
+    logging.info("Starting Seederr (v9.8 - Performance Tracking)")
     
     qbit_client = connect_to_qbit(QBIT_CONFIG, CHECK_INTERVAL)
     db_conn = db_connect()
@@ -218,13 +239,17 @@ def main():
     with db_conn.cursor() as cursor:
         setup_database(cursor)
     db_conn.commit()
+    
+    # --- Performance Tracking Initialization ---
+    total_cache_hits = 0
+    total_cache_misses = 0
+    start_time = time.time()
 
     while True:
         try:
             logging.info("--- Starting new verification cycle ---")
             
             with db_conn.cursor(cursor_factory=RealDictCursor) as cursor:
-                # This is the line that can fail and trigger the exception
                 api_torrents = qbit_client.get_torrents()
                 logging.info(f"Retrieved {len(api_torrents)} torrents from qBittorrent for processing.")
                 current_timestamp = int(time.time())
@@ -235,8 +260,8 @@ def main():
                     cursor.execute("SELECT * FROM torrents WHERE hash = %s", (t['hash'],))
                     db_entry = cursor.fetchone()
                     
-                    current_seeders = t.get('num_complete', 0)
                     current_leechers = t.get('num_incomplete', 0)
+                    current_seeders = t.get('num_complete', 0)
 
                     if not db_entry:
                         location = 'ssd' if t['content_path'].startswith(SSD_PATH) else 'array'
@@ -244,8 +269,7 @@ def main():
                             INSERT INTO torrents (
                                 hash, name, size, save_path, content_path, master_content_path, master_save_path,
                                 location, added_on, last_checked, current_leechers, current_seeders
-                            )
-                            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                         """, (
                             t['hash'], t['name'], t['size'], t['save_path'], t['content_path'], t['content_path'], t['save_path'],
                             location, t['added_on'], current_timestamp, current_leechers, current_seeders
@@ -254,13 +278,18 @@ def main():
                         cursor.execute("SELECT * FROM torrents WHERE hash = %s", (t['hash'],))
                         db_entry = cursor.fetchone()
 
+                    # --- Cache Hit/Miss Logic ---
+                    # Each leecher is a "request". If the torrent is on the SSD, it's a "hit". Otherwise, it's a "miss".
+                    if current_leechers > 0:
+                        if db_entry['location'] == 'ssd':
+                            total_cache_hits += current_leechers
+                        else:
+                            total_cache_misses += current_leechers
+                    
                     cursor.execute("""
-                        UPDATE torrents SET 
-                            last_checked = %s, current_leechers = %s, current_seeders = %s, name = %s
+                        UPDATE torrents SET last_checked = %s, current_leechers = %s, current_seeders = %s, name = %s
                         WHERE hash = %s
-                    """, (
-                        current_timestamp, current_leechers, current_seeders, t['name'], t['hash']
-                    ))
+                    """, (current_timestamp, current_leechers, current_seeders, t['name'], t['hash']))
                     
                     if current_leechers > 0:
                         sl_ratio_bonus = (current_leechers / (current_seeders + 1)) * WEIGHT_SL_RATIO
@@ -276,7 +305,9 @@ def main():
 
                 db_conn.commit()
                 logging.info("Stats updated and demand scores calculated for all torrents.")
-
+                
+                # --- The rest of the logic remains the same ---
+                
                 all_db_torrents.sort(key=lambda x: x['weighted_score'], reverse=True)
                 
                 try:
@@ -331,9 +362,6 @@ def main():
         
         except requests.exceptions.RequestException as e:
             logging.error(f"Connection to qBittorrent lost during cycle: {e}. Attempting to create a new connection for the next cycle.")
-            # This logic prevents the crash.
-            # We try to create a new client. If it fails, we catch the exception and log it.
-            # The script will then wait for CHECK_INTERVAL before trying again in the next loop iteration.
             try:
                 qbit_client = QBittorrentClient(QBIT_CONFIG)
                 logging.info("New qBittorrent client created successfully.")
@@ -342,7 +370,10 @@ def main():
         
         except Exception as e:
             logging.critical(f"An unhandled critical error occurred: {e}", exc_info=True); time.sleep(300)
-
+        
+        # --- Display performance report at the end of the cycle ---
+        print_performance_report(total_cache_hits, total_cache_misses, start_time)
+        
         logging.info(f"Cycle complete. Next check in {CHECK_INTERVAL / 3600:.1f} hour(s).")
         time.sleep(CHECK_INTERVAL)
 

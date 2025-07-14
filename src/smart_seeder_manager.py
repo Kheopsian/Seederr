@@ -214,25 +214,26 @@ def relegate_torrent(qbit_client, cursor, torrent):
         logging.error(f"Failed to relegate torrent {torrent['hash']}: {e}", exc_info=True)
 
 def print_performance_report(hit_score, miss_score, start_time):
-    """Displays a performance and uptime report based on I/O stress score."""
+    """Displays a performance and uptime report using the logging module."""
     uptime_seconds = time.time() - start_time
     uptime_str = str(timedelta(seconds=int(uptime_seconds)))
 
-    print("\n" + "="*80)
-    print(f"I/O STRESS & STATUS REPORT")
-    print(f"Total Uptime: {uptime_str}")
-    print("-"*80)
+    # Use logging.info instead of print to ensure output goes to the log stream
+    logging.info("="*80)
+    logging.info("I/O STRESS & STATUS REPORT")
+    logging.info(f"Total Uptime: {uptime_str}")
+    logging.info("-"*80)
     
-    print(f"  ✅ Cache Hit Score: {int(hit_score):,}")
-    print(f"  ❌ Cache Miss Score: {int(miss_score):,}")
+    logging.info(f"  ✅ Cache Hit Score: {int(hit_score):,}")
+    logging.info(f"  ❌ Cache Miss Score: {int(miss_score):,}")
     
     total_score = hit_score + miss_score
     if total_score > 0:
         cache_hit_rate = (hit_score / total_score) * 100
-        print(f"  => Cache Hit Rate (by I/O Score): {cache_hit_rate:.2f}%")
+        logging.info(f"  => Cache Hit Rate (by I/O Score): {cache_hit_rate:.2f}%")
     else:
-        print("  => Cache Hit Rate: N/A (no upload activity recorded yet)")
-    print("="*80 + "\n")
+        logging.info("  => Cache Hit Rate: N/A (no upload activity recorded yet)")
+    logging.info("="*80)
 
 def main():
     if DRY_RUN:

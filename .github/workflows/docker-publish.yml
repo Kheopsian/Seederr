@@ -33,8 +33,6 @@ jobs:
         with:
           # The build context (the set of files available to the build) is the project's root directory.
           context: .
-          # The path to the Dockerfile, relative to the context.
-          file: ./src/Dockerfile
           # Push the image to the registry after a successful build.
           push: true
           # The name and tag for the image.

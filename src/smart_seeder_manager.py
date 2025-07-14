@@ -3,17 +3,17 @@
 
 """
 Seederr: Smart Seeder Manager
-Version: 11.0 (Dual-Loop Architecture)
+Version: 12.0 (Library-Powered)
 
-This script uses a dual-loop architecture.
-- A fast loop (data collector) runs every 15s to gather precise I/O data per peer.
-- A slow loop (decision maker) runs every 30m to analyze the collected data and perform torrent moves.
+This script uses the official qbittorrent-api library for all client interactions,
+ensuring robust and accurate data collection.
+- A fast loop gathers precise I/O data.
+- A slow loop analyzes data and performs torrent moves.
 Database migrations are handled externally by Alembic.
 """
 
 import os
 import time
-import requests
 import psycopg2
 import logging
 import shutil
@@ -21,12 +21,12 @@ import threading
 from pathlib import Path
 from psycopg2.extras import RealDictCursor
 from datetime import timedelta
+import qbittorrentapi
 
 # --- Configuration ---
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s', datefmt='%Y-%m-%d %H:%M:%S')
 
 # --- Environment Variable Loading ---
-QBIT_CONFIG = { "host": os.environ.get('QBIT_HOST'), "port": os.environ.get('QBIT_PORT'), "user": os.environ.get('QBIT_USER'), "pass": os.environ.get('QBIT_PASS') }
 DB_CONFIG = { "host": os.environ.get('DB_HOST'), "port": os.environ.get('DB_PORT'), "name": os.environ.get('DB_NAME'), "user": os.environ.get('DB_USER'), "pass": os.environ.get('DB_PASS') }
 SSD_PATH = os.environ.get('SSD_PATH_IN_CONTAINER')
 ARRAY_PATH = os.environ.get('ARRAY_PATH_IN_CONTAINER')
@@ -40,91 +40,26 @@ SSD_TARGET_CAPACITY_PERCENT = int(os.environ.get('SSD_TARGET_CAPACITY_PERCENT', 
 MAX_MOVES_PER_CYCLE = int(os.environ.get('MAX_MOVES_PER_CYCLE', 1))
 DRY_RUN = os.environ.get('DRY_RUN', 'true').lower() == 'true'
 SSD_CACHE_TAG = 'ssdCache'
-PEER_STATS_CLEANUP_HOURS = 24 # Remove peer stats if not seen for this many hours
+PEER_STATS_CLEANUP_HOURS = 24
 
-class QBittorrentClient:
-    """
-    Client to interact with the qBittorrent WebUI API, with auto-relogin.
-    This version uses the /sync/maindata endpoint for real-time data
-    and forces a full data refresh on every call for maximum accuracy.
-    """
-    def __init__(self, config):
-        self.base_url = f"http://{config['host']}:{config['port']}"
-        self.user = config['user']
-        self.password = config['pass']
-        self.session = requests.Session()
-        self.session.headers.update({'Referer': self.base_url})
-        self._login()
-
-    def _login(self):
-        login_url = f"{self.base_url}/api/v2/auth/login"
-        login_data = {'username': self.user, 'password': self.password}
-        try:
-            r = self.session.post(login_url, data=login_data, timeout=10)
-            r.raise_for_status()
-            if r.text.strip() != "Ok.":
-                raise ConnectionError("qBittorrent login failed: Invalid credentials or unexpected response.")
-            logging.info("Successfully (re)connected to qBittorrent API.")
-        except requests.exceptions.RequestException as e:
-            logging.error(f"Error connecting to qBittorrent API during login: {e}")
-            raise
-
-    def _request_wrapper(self, method, url, **kwargs):
-        try:
-            r = self.session.request(method, url, **kwargs)
-            if r.status_code == 403:
-                logging.warning("Received 403 Forbidden. Session may have expired. Attempting to re-login.")
-                self._login()
-                r = self.session.request(method, url, **kwargs)
-            r.raise_for_status()
-            return r
-        except requests.exceptions.RequestException as e:
-            logging.error(f"qBittorrent API request failed for {method} {url}: {e}")
-            return None
-
-    def get_torrents(self):
-        """
-        Gets torrent data using /sync/maindata. Omitting the 'rid' parameter
-        forces a full data refresh, ensuring real-time speed data is always present.
-        """
-        url = f"{self.base_url}/api/v2/sync/maindata" # 'rid' parameter is removed
-        response = self._request_wrapper('get', url, timeout=30)
-        
-        if not response:
-            return []
-
-        data = response.json()
-        torrents_dict = data.get('torrents', {})
-        
-        torrents_list = []
-        for torrent_hash, torrent_data in torrents_dict.items():
-            torrent_data['hash'] = torrent_hash
-            torrents_list.append(torrent_data)
-            
-        return torrents_list
-
-    def get_torrent_peers(self, torrent_hash):
-        url = f"{self.base_url}/api/v2/sync/torrentPeers?hash={torrent_hash}"
-        response = self._request_wrapper('get', url, timeout=20)
-        return response.json().get('peers', {}) if response else {}
-
-    def set_location(self, torrent_hash, new_save_path):
-        url = f"{self.base_url}/api/v2/torrents/setLocation"
-        data = {'hashes': torrent_hash, 'location': str(new_save_path)}
-        self._request_wrapper('post', url, data=data, timeout=60)
-        logging.info(f"Set new save_path for torrent {torrent_hash} to '{new_save_path}'.")
-
-    def add_tags(self, torrent_hash, tags):
-        url = f"{self.base_url}/api/v2/torrents/addTags"
-        data = {'hashes': torrent_hash, 'tags': tags}
-        self._request_wrapper('post', url, data=data, timeout=15)
-        logging.info(f"Added tags '{tags}' to torrent {torrent_hash}.")
-
-    def remove_tags(self, torrent_hash, tags):
-        url = f"{self.base_url}/api/v2/torrents/removeTags"
-        data = {'hashes': torrent_hash, 'tags': tags}
-        self._request_wrapper('post', url, data=data, timeout=15)
-        logging.info(f"Removed tags '{tags}' from torrent {torrent_hash}.")
+def get_qbit_client():
+    """Establishes a connection to qBittorrent and returns a client object."""
+    try:
+        client = qbittorrentapi.Client(
+            host=os.environ.get('QBIT_HOST'),
+            port=os.environ.get('QBIT_PORT'),
+            username=os.environ.get('QBIT_USER'),
+            password=os.environ.get('QBIT_PASS'),
+            REQUESTS_TIMEOUT=30
+        )
+        client.auth_log_in()
+        logging.info(f"Successfully connected to qBittorrent v{client.app.version} at {client.host}.")
+        return client
+    except qbittorrentapi.LoginFailed as e:
+        logging.error(f"qBittorrent login failed: {e}")
+    except Exception as e:
+        logging.error(f"Failed to connect to qBittorrent: {e}")
+    return None
 
 def db_connect():
     """Establishes a persistent connection to the database."""
@@ -145,7 +80,7 @@ def promote_torrent(qbit_client, db_conn, torrent):
     except ValueError:
         logging.error(f"Cannot calculate relative path for '{source_path}'. Skipping promotion.")
         return
-        
+
     destination_content_path = Path(SSD_PATH) / relative_path
     destination_save_path = destination_content_path.parent
 
@@ -161,12 +96,12 @@ def promote_torrent(qbit_client, db_conn, torrent):
         else:
             shutil.copy2(source_path, destination_content_path)
 
-        logging.info(f"Copy complete. Repointing qBittorrent to new save_path: {destination_save_path}")
-        qbit_client.set_location(torrent['hash'], str(destination_save_path))
-        qbit_client.add_tags(torrent['hash'], SSD_CACHE_TAG)
+        logging.info(f"Copy complete. Repointing qBittorrent...")
+        qbit_client.torrents_set_location(torrent_hashes=torrent['hash'], location=str(destination_save_path))
+        qbit_client.torrents_add_tags(tags=SSD_CACHE_TAG, torrent_hashes=torrent['hash'])
 
         with db_conn.cursor() as cursor:
-            cursor.execute("UPDATE torrents SET location = 'ssd', content_path = %s, save_path = %s WHERE hash = %s", 
+            cursor.execute("UPDATE torrents SET location = 'ssd', content_path = %s, save_path = %s WHERE hash = %s",
                             (str(destination_content_path), str(destination_save_path), torrent['hash']))
         db_conn.commit()
         logging.info(f"PROMOTION successful for '{torrent['name']}'.")
@@ -178,18 +113,18 @@ def relegate_torrent(qbit_client, db_conn, torrent):
     ssd_content_path = Path(torrent['content_path'])
     master_save_path = torrent['master_save_path']
     master_content_path = torrent['master_content_path']
-    
+
     if DRY_RUN:
         logging.info(f"[DRY RUN] RELEGATION: Would re-point '{torrent['name']}' to '{master_save_path}' and delete from cache.")
         return
 
     try:
-        logging.info(f"RELEGATING '{torrent['name']}'. Repointing to master save_path: {master_save_path}")
-        qbit_client.set_location(torrent['hash'], master_save_path)
-        qbit_client.remove_tags(torrent['hash'], SSD_CACHE_TAG)
+        logging.info(f"RELEGATING '{torrent['name']}'. Repointing to master save_path...")
+        qbit_client.torrents_set_location(torrent_hashes=torrent['hash'], location=master_save_path)
+        qbit_client.torrents_remove_tags(tags=SSD_CACHE_TAG, torrent_hashes=torrent['hash'])
 
-        time.sleep(10) 
-        
+        time.sleep(10)
+
         logging.info(f"Deleting cached version from SSD: '{ssd_content_path}'")
         if not str(ssd_content_path).startswith(SSD_PATH):
              logging.error(f"SAFETY CHECK FAILED: Path '{ssd_content_path}' is not on the SSD. Aborting delete.")
@@ -198,9 +133,9 @@ def relegate_torrent(qbit_client, db_conn, torrent):
             shutil.rmtree(ssd_content_path)
         elif ssd_content_path.is_file():
             ssd_content_path.unlink()
-        
+
         with db_conn.cursor() as cursor:
-            cursor.execute("UPDATE torrents SET location = 'array', content_path = %s, save_path = %s WHERE hash = %s", 
+            cursor.execute("UPDATE torrents SET location = 'array', content_path = %s, save_path = %s WHERE hash = %s",
                             (master_content_path, master_save_path, torrent['hash']))
         db_conn.commit()
         logging.info(f"RELEGATION successful for '{torrent['name']}'.")
@@ -209,121 +144,103 @@ def relegate_torrent(qbit_client, db_conn, torrent):
 
 
 def data_collector_loop():
-    """
-    Fast loop (every 15s). Connects and collects per-peer upload data.
-    """
-    # This thread now creates its own connections.
-    qbit_client = QBittorrentClient(QBIT_CONFIG)
+    """Fast loop (every 15s). Connects and collects per-peer upload data."""
+    qbit_client = get_qbit_client()
     db_conn = db_connect()
     logging.info("Data Collector thread started and connected.")
 
     while True:
         try:
             time.sleep(DATA_COLLECTION_INTERVAL)
-            
-            all_torrents = qbit_client.get_torrents()
-            if not all_torrents:
-                logging.warning("Data Collector: get_torrents() returned no data. Check qBit connection.")
-                continue
+            if not qbit_client: qbit_client = get_qbit_client()
+            if not qbit_client: continue
 
-            active_torrents = [t for t in all_torrents if t.get('up_speed', 0) > 0]
-            
+            # Get all torrents with real-time data
+            all_torrents = qbit_client.torrents_info()
+            active_torrents = [t for t in all_torrents if t.upspeed > 0]
+
             if not active_torrents:
-                # This log confirms the thread is running even with no active uploads.
                 logging.info("Data Collector: Cycle check. No torrents with active upload speed detected.")
                 continue
 
             logging.info(f"Data Collector: Found {len(active_torrents)} torrent(s) with active upload. Processing...")
-            
+
             with db_conn.cursor(cursor_factory=RealDictCursor) as cursor:
                 for torrent in active_torrents:
-                    thash = torrent['hash']
-                    cursor.execute("SELECT location, total_uploaded FROM torrents WHERE hash = %s", (thash,))
+                    cursor.execute("SELECT location, total_uploaded FROM torrents WHERE hash = %s", (torrent.hash,))
                     db_torrent = cursor.fetchone()
-                    if not db_torrent:
-                        continue
-                    
-                    torrent_location = db_torrent['location']
-                    peers_data = qbit_client.get_torrent_peers(thash)
-                    if not peers_data:
-                        continue
-                        
-                    active_peers_count = sum(1 for peer in peers_data.values() if peer.get('up_speed', 0) > 0)
+                    if not db_torrent: continue
+
+                    peers_data = torrent.peers
+                    active_peers_count = sum(1 for peer in peers_data if peer.up_speed > 0)
 
                     if active_peers_count > 0:
-                        prev_total_uploaded = db_torrent['total_uploaded']
-                        current_total_uploaded = torrent['uploaded']
-                        upload_delta = current_total_uploaded - prev_total_uploaded
-                        
+                        upload_delta = torrent.uploaded - db_torrent['total_uploaded']
                         if upload_delta > 0:
                             io_stress_score = upload_delta * active_peers_count
-                            score_column = 'io_hit_score' if torrent_location == 'ssd' else 'io_miss_score'
-                            
+                            score_column = 'io_hit_score' if db_torrent['location'] == 'ssd' else 'io_miss_score'
+
                             cursor.execute(
                                 f"UPDATE torrents SET {score_column} = {score_column} + %s, total_uploaded = %s WHERE hash = %s",
-                                (io_stress_score, current_total_uploaded, thash)
+                                (io_stress_score, torrent.uploaded, torrent.hash)
                             )
-                            logging.info(f"Data Collector: Logged {io_stress_score:,} to {score_column} for torrent {thash[:8]}...")
-
+                            logging.info(f"Data Collector: Logged {io_stress_score:,} to {score_column} for torrent {torrent.hash[:8]}...")
                 db_conn.commit()
 
         except (psycopg2.InterfaceError, psycopg2.OperationalError) as e:
-            logging.error(f"Data Collector: Database connection lost: {e}. Attempting to reconnect..."); 
+            logging.error(f"Data Collector: Database connection lost: {e}. Attempting to reconnect...");
             if db_conn: db_conn.close()
             db_conn = db_connect()
+        except qbittorrentapi.APIError as e:
+            logging.error(f"Data Collector: qBittorrent API Error: {e}. Reconnecting...");
+            qbit_client = None
         except Exception as e:
             logging.error(f"Critical error in Data Collector thread: {e}", exc_info=True)
 
 
 def decision_maker_loop():
-    """
-    Slow loop. Connects and analyzes data to perform torrent moves.
-    """
-    # This thread also creates its own connections.
-    qbit_client = QBittorrentClient(QBIT_CONFIG)
+    """Slow loop. Connects and analyzes data to perform torrent moves."""
+    qbit_client = get_qbit_client()
     db_conn = db_connect()
     logging.info("Decision Maker thread started and connected.")
     start_time = time.time()
-    
+
     while True:
         try:
-            # The logic inside the loop remains the same
+            if not qbit_client: qbit_client = get_qbit_client()
+            if not qbit_client: time.sleep(DECISION_MAKING_INTERVAL); continue
+
             logging.info("--- Decision Maker: Starting new verification cycle ---")
-            
+
             with db_conn.cursor(cursor_factory=RealDictCursor) as cursor:
-                api_torrents = qbit_client.get_torrents()
+                api_torrents = qbit_client.torrents_info()
                 current_timestamp = int(time.time())
 
-                api_hashes = {t['hash'] for t in api_torrents}
+                api_hashes = {t.hash for t in api_torrents}
                 if api_hashes:
                     cursor.execute("DELETE FROM torrents WHERE hash NOT IN %s", (tuple(api_hashes),))
-                
+
                 for t in api_torrents:
-                    cursor.execute("SELECT hash FROM torrents WHERE hash = %s", (t['hash'],))
-                    db_entry = cursor.fetchone()
-                    
-                    if not db_entry:
-                        location = 'ssd' if t['content_path'].startswith(SSD_PATH) else 'array'
+                    cursor.execute("SELECT hash FROM torrents WHERE hash = %s", (t.hash,))
+                    if not cursor.fetchone():
+                        location = 'ssd' if t.content_path.startswith(SSD_PATH) else 'array'
                         cursor.execute("""
-                            INSERT INTO torrents (hash, name, size, save_path, content_path, master_content_path, master_save_path, location, added_on, last_checked, total_uploaded) 
+                            INSERT INTO torrents (hash, name, size, save_path, content_path, master_content_path, master_save_path, location, added_on, last_checked, total_uploaded)
                             VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                         """, (
-                            t['hash'], t['name'], t['size'], t['save_path'], t['content_path'], t['content_path'], t['save_path'],
-                            location, t['added_on'], current_timestamp, t.get('uploaded', 0)
+                            t.hash, t.name, t.size, t.save_path, t.content_path, t.content_path, t.save_path,
+                            location, t.added_on, current_timestamp, t.uploaded
                         ))
                     else:
-                        cursor.execute("UPDATE torrents SET last_checked = %s, name = %s WHERE hash = %s", 
-                                       (current_timestamp, t['name'], t['hash']))
-                
+                        cursor.execute("UPDATE torrents SET last_checked = %s, name = %s WHERE hash = %s",
+                                       (current_timestamp, t.name, t.hash))
                 db_conn.commit()
                 logging.info("Decision Maker: Torrent list synchronized with database.")
 
                 cursor.execute("SELECT * FROM torrents")
                 all_db_torrents = cursor.fetchall()
-                
                 all_db_torrents.sort(key=lambda x: (x['io_miss_score'], x['io_hit_score']), reverse=True)
-                logging.info("Decision Maker: Torrents sorted by I/O demand (misses prioritized).")
-                
+
                 try:
                     total_ssd_space, _, _ = shutil.disk_usage(SSD_PATH)
                     used_ssd_space = sum(f.stat().st_size for f in Path(SSD_PATH).glob('**/*') if f.is_file())
@@ -339,12 +256,10 @@ def decision_maker_loop():
                     if (t['io_miss_score'] > 0 or t['io_hit_score'] > 0) and temp_size + t['size'] <= target_ssd_usage:
                         ideal_ssd_hashes.add(t['hash'])
                         temp_size += t['size']
-                
+
                 current_ssd_hashes = {t['hash'] for t in all_db_torrents if t['location'] == 'ssd'}
-                
                 promotions_to_run = [t for t in all_db_torrents if t['hash'] in (ideal_ssd_hashes - current_ssd_hashes)]
                 relegations_to_run = [t for t in all_db_torrents if t['hash'] in (current_ssd_hashes - ideal_ssd_hashes)]
-                
                 relegations_to_run.sort(key=lambda x: (x.get('io_miss_score', 0), x.get('io_hit_score', 0)))
 
                 logging.info(f"Analysis complete: {len(promotions_to_run)} promotion(s) and {len(relegations_to_run)} relegation(s) identified.")
@@ -354,7 +269,7 @@ def decision_maker_loop():
                     if moves_done >= MAX_MOVES_PER_CYCLE: break
                     relegate_torrent(qbit_client, db_conn, torrent)
                     moves_done += 1
-                
+
                 current_used_space = sum(f.stat().st_size for f in Path(SSD_PATH).glob('**/*') if f.is_file())
                 for torrent in promotions_to_run:
                     if moves_done >= MAX_MOVES_PER_CYCLE: break
@@ -364,70 +279,55 @@ def decision_maker_loop():
                         moves_done += 1
                     else:
                         logging.warning(f"Skipping promotion of '{torrent['name']}': not enough free space on SSD.")
-                
+
                 cursor.execute("SELECT SUM(io_hit_score) as total_hits, SUM(io_miss_score) as total_misses FROM torrents")
                 report_data = cursor.fetchone()
                 total_hit_score = report_data['total_hits'] or 0
                 total_miss_score = report_data['total_misses'] or 0
-                
                 uptime_seconds = time.time() - start_time
                 uptime_str = str(timedelta(seconds=int(uptime_seconds)))
 
                 logging.info("="*80)
-                logging.info("I/O STRESS & STATUS REPORT")
-                logging.info(f"Total Uptime: {uptime_str}")
+                logging.info(f"I/O STRESS & STATUS REPORT (Uptime: {uptime_str})")
                 logging.info("-"*80)
                 logging.info(f"  ✅ Cumulative Cache Hit Score: {int(total_hit_score):,}")
                 logging.info(f"  ❌ Cumulative Cache Miss Score: {int(total_miss_score):,}")
-                
                 total_score = total_hit_score + total_miss_score
                 if total_score > 0:
-                    cache_hit_rate = (total_hit_score / total_score) * 100
-                    logging.info(f"  => Cache Efficiency (Cycle): {cache_hit_rate:.2f}%")
+                    logging.info(f"  => Cache Efficiency (Cycle): {(total_hit_score / total_score) * 100:.2f}%")
                 else:
                     logging.info("  => Cache Efficiency (Cycle): N/A (no I/O score recorded)")
                 logging.info("="*80)
-                
+
                 logging.info("Resetting I/O scores for the next decision cycle.")
                 cursor.execute("UPDATE torrents SET io_hit_score = 0, io_miss_score = 0")
-                
-                cleanup_threshold = current_timestamp - (PEER_STATS_CLEANUP_HOURS * 3600)
-                cursor.execute("DELETE FROM peer_stats WHERE last_seen < %s", (cleanup_threshold,))
-                logging.info(f"Cleaned up {cursor.rowcount} stale peer entries.")
                 db_conn.commit()
 
         except (psycopg2.InterfaceError, psycopg2.OperationalError) as e:
-            logging.error(f"Decision Maker: Database connection lost: {e}. Attempting to reconnect..."); 
+            logging.error(f"Decision Maker: Database connection lost: {e}. Attempting to reconnect...");
             if db_conn: db_conn.close()
             db_conn = db_connect()
+        except qbittorrentapi.APIError as e:
+            logging.error(f"Decision Maker: qBittorrent API Error: {e}. Reconnecting...");
+            qbit_client = None
         except Exception as e:
             logging.critical(f"An unhandled critical error occurred in Decision Maker: {e}", exc_info=True)
-        
+
         logging.info(f"Decision cycle complete. Next check in {DECISION_MAKING_INTERVAL / 3600:.1f} hour(s).")
         time.sleep(DECISION_MAKING_INTERVAL)
 
 
 if __name__ == "__main__":
-    required_vars = ['QBIT_HOST', 'QBIT_PORT', 'QBIT_USER', 'QBIT_PASS', 'DB_HOST', 'DB_PORT', 'DB_NAME', 'DB_USER', 'DB_PASS', 'SSD_PATH_IN_CONTAINER', 'ARRAY_PATH_IN_CONTAINER']
-    missing_vars = [var for var in required_vars if not os.environ.get(var)]
-    
-    if missing_vars:
-        logging.critical(f"Critical environment variables are missing: {', '.join(missing_vars)}. Exiting.")
-        exit(1)
-        
     if DRY_RUN:
         logging.warning("="*50); logging.warning("=== SCRIPT IS RUNNING IN DRY RUN MODE ==="); logging.warning("="*50)
-    
-    logging.info("Starting Seederr (v11.1 - Thread-Safe)")
 
-    # The main thread now only creates and starts the worker threads.
-    # It no longer creates shared resources.
+    logging.info("Starting Seederr (v12.0 - Library-Powered)")
+
     collector_thread = threading.Thread(target=data_collector_loop, daemon=True)
     decision_thread = threading.Thread(target=decision_maker_loop, daemon=True)
-    
+
     collector_thread.start()
     decision_thread.start()
-    
-    # Keep the main thread alive to allow daemon threads to run.
+
     while True:
         time.sleep(1)

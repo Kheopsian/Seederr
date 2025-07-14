@@ -45,7 +45,8 @@ PEER_STATS_CLEANUP_HOURS = 24 # Remove peer stats if not seen for this many hour
 class QBittorrentClient:
     """
     Client to interact with the qBittorrent WebUI API, with auto-relogin.
-    This version uses the /sync/maindata endpoint for real-time data.
+    This version uses the /sync/maindata endpoint for real-time data
+    and forces a full data refresh on every call for maximum accuracy.
     """
     def __init__(self, config):
         self.base_url = f"http://{config['host']}:{config['port']}"
@@ -53,7 +54,6 @@ class QBittorrentClient:
         self.password = config['pass']
         self.session = requests.Session()
         self.session.headers.update({'Referer': self.base_url})
-        self.rid = 0  # Response ID for sync requests
         self._login()
 
     def _login(self):
@@ -64,7 +64,6 @@ class QBittorrentClient:
             r.raise_for_status()
             if r.text.strip() != "Ok.":
                 raise ConnectionError("qBittorrent login failed: Invalid credentials or unexpected response.")
-            self.rid = 0 # Reset response ID on re-login
             logging.info("Successfully (re)connected to qBittorrent API.")
         except requests.exceptions.RequestException as e:
             logging.error(f"Error connecting to qBittorrent API during login: {e}")
@@ -85,21 +84,18 @@ class QBittorrentClient:
 
     def get_torrents(self):
         """
-        Gets torrent data using the /sync/maindata endpoint for real-time accuracy.
+        Gets torrent data using /sync/maindata. Omitting the 'rid' parameter
+        forces a full data refresh, ensuring real-time speed data is always present.
         """
-        url = f"{self.base_url}/api/v2/sync/maindata?rid={self.rid}"
+        url = f"{self.base_url}/api/v2/sync/maindata" # 'rid' parameter is removed
         response = self._request_wrapper('get', url, timeout=30)
         
         if not response:
             return []
 
         data = response.json()
-        self.rid = data.get('rid', self.rid)
-
         torrents_dict = data.get('torrents', {})
         
-        # --- FIX ---
-        # The hash is the key. We must add it to the torrent object itself.
         torrents_list = []
         for torrent_hash, torrent_data in torrents_dict.items():
             torrent_data['hash'] = torrent_hash

@@ -94,19 +94,24 @@ class QBittorrentClient:
             return []
 
         data = response.json()
-        self.rid = data.get('rid', self.rid) # Update the response ID for the next call
+        self.rid = data.get('rid', self.rid)
 
-        # The 'torrents' key contains a dictionary of torrents, keyed by their hash.
-        # We return a list of the torrent objects, similar to the old method.
         torrents_dict = data.get('torrents', {})
-        return list(torrents_dict.values())
+        
+        # --- FIX ---
+        # The hash is the key. We must add it to the torrent object itself.
+        torrents_list = []
+        for torrent_hash, torrent_data in torrents_dict.items():
+            torrent_data['hash'] = torrent_hash
+            torrents_list.append(torrent_data)
+            
+        return torrents_list
 
     def get_torrent_peers(self, torrent_hash):
         url = f"{self.base_url}/api/v2/sync/torrentPeers?hash={torrent_hash}"
         response = self._request_wrapper('get', url, timeout=20)
         return response.json().get('peers', {}) if response else {}
 
-    # set_location, add_tags, and remove_tags methods remain unchanged
     def set_location(self, torrent_hash, new_save_path):
         url = f"{self.base_url}/api/v2/torrents/setLocation"
         data = {'hashes': torrent_hash, 'location': str(new_save_path)}

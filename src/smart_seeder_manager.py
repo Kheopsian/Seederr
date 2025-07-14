@@ -49,8 +49,8 @@ def get_qbit_client():
             host=os.environ.get('QBIT_HOST'),
             port=os.environ.get('QBIT_PORT'),
             username=os.environ.get('QBIT_USER'),
-            password=os.environ.get('QBIT_PASS'),
-            REQUESTS_TIMEOUT=30
+            password=os.environ.get('QBIT_PASS')
+            # The invalid REQUESTS_TIMEOUT argument has been removed.
         )
         client.auth_log_in()
         logging.info(f"Successfully connected to qBittorrent v{client.app.version} at {client.host}.")

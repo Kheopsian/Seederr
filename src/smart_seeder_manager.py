@@ -172,7 +172,7 @@ def data_collector_loop():
 
                     # --- FIX ---
                     # Peer data must be fetched with a separate API call per torrent.
-                    peers_data = qbit_client.torrents_peers(torrent_hash=torrent.hash)
+                    peers_data = qbit_client.sync.torrent_peers(torrent_hash=torrent.hash)
                     
                     if not peers_data or 'peers' not in peers_data:
                         continue

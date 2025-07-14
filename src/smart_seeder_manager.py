@@ -50,7 +50,6 @@ def get_qbit_client():
             port=os.environ.get('QBIT_PORT'),
             username=os.environ.get('QBIT_USER'),
             password=os.environ.get('QBIT_PASS')
-            # The invalid REQUESTS_TIMEOUT argument has been removed.
         )
         client.auth_log_in()
         logging.info(f"Successfully connected to qBittorrent v{client.app.version} at {client.host}.")
@@ -162,7 +161,9 @@ def data_collector_loop():
                 logging.info("Data Collector: Cycle check. No torrents with active upload speed detected.")
                 continue
 
-            logging.info(f"Data Collector: Found {len(active_torrents)} torrent(s) with active upload. Processing...")
+            # Initialize total score counters for the cycle
+            total_io_hit_score = 0
+            total_io_miss_score = 0
 
             with db_conn.cursor(cursor_factory=RealDictCursor) as cursor:
                 for torrent in active_torrents:
@@ -170,28 +171,44 @@ def data_collector_loop():
                     db_torrent = cursor.fetchone()
                     if not db_torrent: continue
 
-                    # --- FIX ---
-                    # Peer data must be fetched with a separate API call per torrent.
+                    # Fetch peer data for the torrent
                     peers_data = qbit_client.sync.torrent_peers(torrent_hash=torrent.hash)
                     
                     if not peers_data or 'peers' not in peers_data:
                         continue
                     
-                    # The actual list of peers is inside the 'peers' key
+                    # Count peers that are actively uploading
                     active_peers_count = sum(1 for peer in peers_data['peers'].values() if peer['up_speed'] > 0)
 
                     if active_peers_count > 0:
                         upload_delta = torrent.uploaded - db_torrent['total_uploaded']
                         if upload_delta > 0:
                             io_stress_score = upload_delta * active_peers_count
-                            score_column = 'io_hit_score' if db_torrent['location'] == 'ssd' else 'io_miss_score'
+                            
+                            # Determine score type and update total
+                            if db_torrent['location'] == 'ssd':
+                                score_column = 'io_hit_score'
+                                total_io_hit_score += io_stress_score
+                            else:
+                                score_column = 'io_miss_score'
+                                total_io_miss_score += io_stress_score
 
+                            # Update the database
                             cursor.execute(
                                 f"UPDATE torrents SET {score_column} = {score_column} + %s, total_uploaded = %s WHERE hash = %s",
                                 (io_stress_score, torrent.uploaded, torrent.hash)
                             )
-                            logging.info(f"Data Collector: Logged {io_stress_score:,} to {score_column} for torrent {torrent.hash[:8]}...")
                 db_conn.commit()
+
+            # Log the aggregated results for the cycle if there was activity
+            if total_io_hit_score > 0 or total_io_miss_score > 0:
+                logging.info(
+                    f"Data Collector: {len(active_torrents)} torrents processed. "
+                    f"Total IO Hit Score: {total_io_hit_score:,}. "
+                    f"Total IO Miss Score: {total_io_miss_score:,}."
+                )
+            else:
+                 logging.info(f"Data Collector: {len(active_torrents)} torrents processed. No new I/O score to log.")
 
         except (psycopg2.InterfaceError, psycopg2.OperationalError) as e:
             logging.error(f"Data Collector: Database connection lost: {e}. Attempting to reconnect...");

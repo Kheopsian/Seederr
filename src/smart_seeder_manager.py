@@ -43,13 +43,17 @@ SSD_CACHE_TAG = 'ssdCache'
 PEER_STATS_CLEANUP_HOURS = 24 # Remove peer stats if not seen for this many hours
 
 class QBittorrentClient:
-    """Client to interact with the qBittorrent WebUI API, with auto-relogin."""
+    """
+    Client to interact with the qBittorrent WebUI API, with auto-relogin.
+    This version uses the /sync/maindata endpoint for real-time data.
+    """
     def __init__(self, config):
         self.base_url = f"http://{config['host']}:{config['port']}"
         self.user = config['user']
         self.password = config['pass']
         self.session = requests.Session()
         self.session.headers.update({'Referer': self.base_url})
+        self.rid = 0  # Response ID for sync requests
         self._login()
 
     def _login(self):
@@ -60,6 +64,7 @@ class QBittorrentClient:
             r.raise_for_status()
             if r.text.strip() != "Ok.":
                 raise ConnectionError("qBittorrent login failed: Invalid credentials or unexpected response.")
+            self.rid = 0 # Reset response ID on re-login
             logging.info("Successfully (re)connected to qBittorrent API.")
         except requests.exceptions.RequestException as e:
             logging.error(f"Error connecting to qBittorrent API during login: {e}")
@@ -76,20 +81,32 @@ class QBittorrentClient:
             return r
         except requests.exceptions.RequestException as e:
             logging.error(f"qBittorrent API request failed for {method} {url}: {e}")
-            # Do not raise here, as the loop should continue
             return None
 
     def get_torrents(self):
-        url = f"{self.base_url}/api/v2/torrents/info?filter=all&sort=name"
+        """
+        Gets torrent data using the /sync/maindata endpoint for real-time accuracy.
+        """
+        url = f"{self.base_url}/api/v2/sync/maindata?rid={self.rid}"
         response = self._request_wrapper('get', url, timeout=30)
-        return response.json() if response else []
+        
+        if not response:
+            return []
+
+        data = response.json()
+        self.rid = data.get('rid', self.rid) # Update the response ID for the next call
+
+        # The 'torrents' key contains a dictionary of torrents, keyed by their hash.
+        # We return a list of the torrent objects, similar to the old method.
+        torrents_dict = data.get('torrents', {})
+        return list(torrents_dict.values())
 
     def get_torrent_peers(self, torrent_hash):
         url = f"{self.base_url}/api/v2/sync/torrentPeers?hash={torrent_hash}"
         response = self._request_wrapper('get', url, timeout=20)
-        # The 'peers' key might be missing if there are no connections
         return response.json().get('peers', {}) if response else {}
 
+    # set_location, add_tags, and remove_tags methods remain unchanged
     def set_location(self, torrent_hash, new_save_path):
         url = f"{self.base_url}/api/v2/torrents/setLocation"
         data = {'hashes': torrent_hash, 'location': str(new_save_path)}

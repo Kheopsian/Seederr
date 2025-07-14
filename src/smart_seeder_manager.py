@@ -212,99 +212,98 @@ def relegate_torrent(qbit_client, db_conn, torrent):
         logging.error(f"Failed to relegate torrent {torrent['hash']}: {e}", exc_info=True)
 
 
-def data_collector_loop(qbit_client, db_conn):
+def data_collector_loop():
     """
-    Fast loop (every 15s). Its only job is to collect per-peer upload data for active torrents
-    and update the I/O scores in the database.
+    Fast loop (every 15s). Connects and collects per-peer upload data.
     """
-    logging.info("Data Collector thread started.")
+    # This thread now creates its own connections.
+    qbit_client = QBittorrentClient(QBIT_CONFIG)
+    db_conn = db_connect()
+    logging.info("Data Collector thread started and connected.")
+
     while True:
         try:
             time.sleep(DATA_COLLECTION_INTERVAL)
+            
             all_torrents = qbit_client.get_torrents()
+            if not all_torrents:
+                logging.warning("Data Collector: get_torrents() returned no data. Check qBit connection.")
+                continue
+
             active_torrents = [t for t in all_torrents if t.get('up_speed', 0) > 0]
             
             if not active_torrents:
+                # This log confirms the thread is running even with no active uploads.
+                logging.info("Data Collector: Cycle check. No torrents with active upload speed detected.")
                 continue
 
-            logging.info(f"Data Collector: Found {len(active_torrents)} torrent(s) with active upload.")
+            logging.info(f"Data Collector: Found {len(active_torrents)} torrent(s) with active upload. Processing...")
             
             with db_conn.cursor(cursor_factory=RealDictCursor) as cursor:
                 for torrent in active_torrents:
                     thash = torrent['hash']
-                    
-                    # Get torrent location from our DB
-                    cursor.execute("SELECT location FROM torrents WHERE hash = %s", (thash,))
+                    cursor.execute("SELECT location, total_uploaded FROM torrents WHERE hash = %s", (thash,))
                     db_torrent = cursor.fetchone()
                     if not db_torrent:
-                        continue # Decision-maker will handle new torrents
+                        continue
                     
                     torrent_location = db_torrent['location']
-                    
-                    # Get per-peer data from qBit
                     peers_data = qbit_client.get_torrent_peers(thash)
                     if not peers_data:
                         continue
                         
-                    active_peers_count = 0
-                    for peer_ip, peer in peers_data.items():
-                        if peer.get('up_speed', 0) > 0:
-                            active_peers_count += 1
+                    active_peers_count = sum(1 for peer in peers_data.values() if peer.get('up_speed', 0) > 0)
 
                     if active_peers_count > 0:
-                        # Fetch previous total upload for this torrent
-                        cursor.execute("SELECT total_uploaded FROM torrents WHERE hash = %s", (thash,))
-                        prev_total_uploaded = cursor.fetchone()['total_uploaded']
-                        
+                        prev_total_uploaded = db_torrent['total_uploaded']
                         current_total_uploaded = torrent['uploaded']
                         upload_delta = current_total_uploaded - prev_total_uploaded
                         
                         if upload_delta > 0:
-                            # Calculate score: total data transferred * number of concurrent reads
                             io_stress_score = upload_delta * active_peers_count
-                            
                             score_column = 'io_hit_score' if torrent_location == 'ssd' else 'io_miss_score'
                             
-                            # Atomically increment the score
                             cursor.execute(
                                 f"UPDATE torrents SET {score_column} = {score_column} + %s, total_uploaded = %s WHERE hash = %s",
                                 (io_stress_score, current_total_uploaded, thash)
                             )
-                            logging.info(f"Logged {io_stress_score:,} to {score_column} for torrent {thash[:8]}...")
+                            logging.info(f"Data Collector: Logged {io_stress_score:,} to {score_column} for torrent {thash[:8]}...")
 
                 db_conn.commit()
 
         except (psycopg2.InterfaceError, psycopg2.OperationalError) as e:
             logging.error(f"Data Collector: Database connection lost: {e}. Attempting to reconnect..."); 
-            db_conn.close(); 
+            if db_conn: db_conn.close()
             db_conn = db_connect()
         except Exception as e:
             logging.error(f"Critical error in Data Collector thread: {e}", exc_info=True)
 
 
-def decision_maker_loop(qbit_client, db_conn):
+def decision_maker_loop():
     """
-    Slow loop (every 30-60min). It analyzes the data collected by the fast loop,
-    updates torrent states, and performs promotions/relegations.
+    Slow loop. Connects and analyzes data to perform torrent moves.
     """
-    logging.info("Decision Maker thread started.")
+    # This thread also creates its own connections.
+    qbit_client = QBittorrentClient(QBIT_CONFIG)
+    db_conn = db_connect()
+    logging.info("Decision Maker thread started and connected.")
     start_time = time.time()
     
     while True:
         try:
+            # The logic inside the loop remains the same
             logging.info("--- Decision Maker: Starting new verification cycle ---")
             
             with db_conn.cursor(cursor_factory=RealDictCursor) as cursor:
-                # Sync torrent list from qBit with our DB
                 api_torrents = qbit_client.get_torrents()
                 current_timestamp = int(time.time())
 
-                # Prune deleted torrents
                 api_hashes = {t['hash'] for t in api_torrents}
-                cursor.execute("DELETE FROM torrents WHERE hash NOT IN %s", (tuple(api_hashes) if api_hashes else ('',),))
+                if api_hashes:
+                    cursor.execute("DELETE FROM torrents WHERE hash NOT IN %s", (tuple(api_hashes),))
                 
                 for t in api_torrents:
-                    cursor.execute("SELECT * FROM torrents WHERE hash = %s", (t['hash'],))
+                    cursor.execute("SELECT hash FROM torrents WHERE hash = %s", (t['hash'],))
                     db_entry = cursor.fetchone()
                     
                     if not db_entry:
@@ -323,10 +322,12 @@ def decision_maker_loop(qbit_client, db_conn):
                 db_conn.commit()
                 logging.info("Decision Maker: Torrent list synchronized with database.")
 
-                # --- Rebalancing Logic ---
-                cursor.execute("SELECT *, (io_hit_score + io_miss_score) as total_io_score FROM torrents ORDER BY total_io_score DESC")
+                cursor.execute("SELECT * FROM torrents")
                 all_db_torrents = cursor.fetchall()
-
+                
+                all_db_torrents.sort(key=lambda x: (x['io_miss_score'], x['io_hit_score']), reverse=True)
+                logging.info("Decision Maker: Torrents sorted by I/O demand (misses prioritized).")
+                
                 try:
                     total_ssd_space, _, _ = shutil.disk_usage(SSD_PATH)
                     used_ssd_space = sum(f.stat().st_size for f in Path(SSD_PATH).glob('**/*') if f.is_file())
@@ -339,7 +340,7 @@ def decision_maker_loop(qbit_client, db_conn):
 
                 ideal_ssd_hashes, temp_size = set(), 0
                 for t in all_db_torrents:
-                    if t['total_io_score'] > 0 and temp_size + t['size'] <= target_ssd_usage:
+                    if (t['io_miss_score'] > 0 or t['io_hit_score'] > 0) and temp_size + t['size'] <= target_ssd_usage:
                         ideal_ssd_hashes.add(t['hash'])
                         temp_size += t['size']
                 
@@ -348,8 +349,7 @@ def decision_maker_loop(qbit_client, db_conn):
                 promotions_to_run = [t for t in all_db_torrents if t['hash'] in (ideal_ssd_hashes - current_ssd_hashes)]
                 relegations_to_run = [t for t in all_db_torrents if t['hash'] in (current_ssd_hashes - ideal_ssd_hashes)]
                 
-                # Relegate lowest score torrents first
-                relegations_to_run.sort(key=lambda x: x['total_io_score'])
+                relegations_to_run.sort(key=lambda x: (x.get('io_miss_score', 0), x.get('io_hit_score', 0)))
 
                 logging.info(f"Analysis complete: {len(promotions_to_run)} promotion(s) and {len(relegations_to_run)} relegation(s) identified.")
 
@@ -369,7 +369,6 @@ def decision_maker_loop(qbit_client, db_conn):
                     else:
                         logging.warning(f"Skipping promotion of '{torrent['name']}': not enough free space on SSD.")
                 
-                # --- Reporting and Cleanup ---
                 cursor.execute("SELECT SUM(io_hit_score) as total_hits, SUM(io_miss_score) as total_misses FROM torrents")
                 report_data = cursor.fetchone()
                 total_hit_score = report_data['total_hits'] or 0
@@ -393,26 +392,24 @@ def decision_maker_loop(qbit_client, db_conn):
                     logging.info("  => Cache Efficiency (Cycle): N/A (no I/O score recorded)")
                 logging.info("="*80)
                 
-                # Reset scores for the next cycle
                 logging.info("Resetting I/O scores for the next decision cycle.")
                 cursor.execute("UPDATE torrents SET io_hit_score = 0, io_miss_score = 0")
                 
-                # Cleanup old peer stats
                 cleanup_threshold = current_timestamp - (PEER_STATS_CLEANUP_HOURS * 3600)
                 cursor.execute("DELETE FROM peer_stats WHERE last_seen < %s", (cleanup_threshold,))
                 logging.info(f"Cleaned up {cursor.rowcount} stale peer entries.")
-
                 db_conn.commit()
 
         except (psycopg2.InterfaceError, psycopg2.OperationalError) as e:
             logging.error(f"Decision Maker: Database connection lost: {e}. Attempting to reconnect..."); 
-            db_conn.close(); 
+            if db_conn: db_conn.close()
             db_conn = db_connect()
         except Exception as e:
             logging.critical(f"An unhandled critical error occurred in Decision Maker: {e}", exc_info=True)
         
         logging.info(f"Decision cycle complete. Next check in {DECISION_MAKING_INTERVAL / 3600:.1f} hour(s).")
         time.sleep(DECISION_MAKING_INTERVAL)
+
 
 if __name__ == "__main__":
     required_vars = ['QBIT_HOST', 'QBIT_PORT', 'QBIT_USER', 'QBIT_PASS', 'DB_HOST', 'DB_PORT', 'DB_NAME', 'DB_USER', 'DB_PASS', 'SSD_PATH_IN_CONTAINER', 'ARRAY_PATH_IN_CONTAINER']
@@ -425,18 +422,16 @@ if __name__ == "__main__":
     if DRY_RUN:
         logging.warning("="*50); logging.warning("=== SCRIPT IS RUNNING IN DRY RUN MODE ==="); logging.warning("="*50)
     
-    logging.info("Starting Seederr (v11.0 - Dual-Loop Architecture)")
+    logging.info("Starting Seederr (v11.1 - Thread-Safe)")
 
-    qbit_client = QBittorrentClient(QBIT_CONFIG)
-    db_connection = db_connect()
-    
-    # Start the two main loops in separate threads
-    collector_thread = threading.Thread(target=data_collector_loop, args=(qbit_client, db_connection), daemon=True)
-    decision_thread = threading.Thread(target=decision_maker_loop, args=(qbit_client, db_connection), daemon=True)
+    # The main thread now only creates and starts the worker threads.
+    # It no longer creates shared resources.
+    collector_thread = threading.Thread(target=data_collector_loop, daemon=True)
+    decision_thread = threading.Thread(target=decision_maker_loop, daemon=True)
     
     collector_thread.start()
     decision_thread.start()
     
-    # Keep the main thread alive
+    # Keep the main thread alive to allow daemon threads to run.
     while True:
         time.sleep(1)

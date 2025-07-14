@@ -155,7 +155,6 @@ def data_collector_loop():
             if not qbit_client: qbit_client = get_qbit_client()
             if not qbit_client: continue
 
-            # Get all torrents with real-time data
             all_torrents = qbit_client.torrents_info()
             active_torrents = [t for t in all_torrents if t.upspeed > 0]
 
@@ -171,8 +170,15 @@ def data_collector_loop():
                     db_torrent = cursor.fetchone()
                     if not db_torrent: continue
 
-                    peers_data = torrent.peers
-                    active_peers_count = sum(1 for peer in peers_data if peer.up_speed > 0)
+                    # --- FIX ---
+                    # Peer data must be fetched with a separate API call per torrent.
+                    peers_data = qbit_client.torrents_peers(torrent_hash=torrent.hash)
+                    
+                    if not peers_data or 'peers' not in peers_data:
+                        continue
+                    
+                    # The actual list of peers is inside the 'peers' key
+                    active_peers_count = sum(1 for peer in peers_data['peers'].values() if peer['up_speed'] > 0)
 
                     if active_peers_count > 0:
                         upload_delta = torrent.uploaded - db_torrent['total_uploaded']

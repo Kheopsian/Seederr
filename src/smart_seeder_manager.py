@@ -3,11 +3,11 @@
 
 """
 Seederr: Smart Seeder Manager
-Version: 9.8 (Performance Tracking)
+Version: 10.1 (I/O Stress Metric)
 
 This script manages seeding torrents by copying popular torrents from a "master"
-storage array to a fast SSD cache for optimal seeding. It now tags cached torrents
-in qBittorrent, and tracks cache hit/miss performance.
+storage array to a fast SSD cache. It uses a PostgreSQL database for state and
+calculates cache performance based on an I/O stress score (upload delta * peers).
 """
 
 import os
@@ -81,21 +81,18 @@ class QBittorrentClient:
         return response.json()
 
     def set_location(self, torrent_hash, new_save_path):
-        """Sets a new location for a specific torrent."""
         url = f"{self.base_url}/api/v2/torrents/setLocation"
         data = {'hashes': torrent_hash, 'location': str(new_save_path)}
         self._request_wrapper('post', url, data=data, timeout=60)
         logging.info(f"Set new save_path for torrent {torrent_hash} to '{new_save_path}'.")
 
     def add_tags(self, torrent_hash, tags):
-        """Adds tags to a specific torrent."""
         url = f"{self.base_url}/api/v2/torrents/addTags"
         data = {'hashes': torrent_hash, 'tags': tags}
         self._request_wrapper('post', url, data=data, timeout=15)
         logging.info(f"Added tags '{tags}' to torrent {torrent_hash}.")
 
     def remove_tags(self, torrent_hash, tags):
-        """Removes tags from a specific torrent."""
         url = f"{self.base_url}/api/v2/torrents/removeTags"
         data = {'hashes': torrent_hash, 'tags': tags}
         self._request_wrapper('post', url, data=data, timeout=15)
@@ -122,6 +119,7 @@ def db_connect():
             time.sleep(30)
 
 def setup_database(cursor):
+    """Ensures the database schema is up to date."""
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS torrents (
             hash VARCHAR(40) PRIMARY KEY,
@@ -135,8 +133,18 @@ def setup_database(cursor):
             added_on BIGINT,
             last_checked BIGINT,
             current_leechers INT DEFAULT 0,
-            current_seeders INT DEFAULT 0
+            current_seeders INT DEFAULT 0,
+            total_uploaded BIGINT DEFAULT 0
         );
+    """)
+    # Add the total_uploaded column to existing tables for seamless upgrades.
+    cursor.execute("""
+        DO $$
+        BEGIN
+            IF NOT EXISTS(SELECT 1 FROM information_schema.columns WHERE table_name='torrents' AND column_name='total_uploaded') THEN
+                ALTER TABLE torrents ADD COLUMN total_uploaded BIGINT DEFAULT 0;
+            END IF;
+        END $$;
     """)
 
 def promote_torrent(qbit_client, cursor, torrent):
@@ -205,33 +213,32 @@ def relegate_torrent(qbit_client, cursor, torrent):
     except Exception as e:
         logging.error(f"Failed to relegate torrent {torrent['hash']}: {e}", exc_info=True)
 
-def print_performance_report(hits, misses, start_time):
-    """Displays a performance and uptime report."""
+def print_performance_report(hit_score, miss_score, start_time):
+    """Displays a performance and uptime report based on I/O stress score."""
     uptime_seconds = time.time() - start_time
     uptime_str = str(timedelta(seconds=int(uptime_seconds)))
 
     print("\n" + "="*80)
-    print(f"PERFORMANCE & STATUS REPORT")
+    print(f"I/O STRESS & STATUS REPORT")
     print(f"Total Uptime: {uptime_str}")
     print("-"*80)
     
-    print(f"  ✅ Cache Hits: {hits:,}")
-    print(f"  ❌ Cache Misses: {misses:,}")
+    print(f"  ✅ Cache Hit Score: {int(hit_score):,}")
+    print(f"  ❌ Cache Miss Score: {int(miss_score):,}")
     
-    total_requests = hits + misses
-    if total_requests > 0:
-        cache_hit_rate = (hits / total_requests) * 100
-        print(f"  => Cache Hit Rate: {cache_hit_rate:.2f}%")
+    total_score = hit_score + miss_score
+    if total_score > 0:
+        cache_hit_rate = (hit_score / total_score) * 100
+        print(f"  => Cache Hit Rate (by I/O Score): {cache_hit_rate:.2f}%")
     else:
-        print("  => Cache Hit Rate: N/A (no leecher requests recorded yet)")
+        print("  => Cache Hit Rate: N/A (no upload activity recorded yet)")
     print("="*80 + "\n")
 
 def main():
-    """Main execution loop using demand-based scoring (leechers and S/L ratio)."""
     if DRY_RUN:
         logging.warning("="*50); logging.warning("=== SCRIPT IS RUNNING IN DRY RUN MODE ==="); logging.warning("="*50)
     
-    logging.info("Starting Seederr (v9.8 - Performance Tracking)")
+    logging.info("Starting Seederr (v10.1 - I/O Stress Metric)")
     
     qbit_client = connect_to_qbit(QBIT_CONFIG, CHECK_INTERVAL)
     db_conn = db_connect()
@@ -240,9 +247,8 @@ def main():
         setup_database(cursor)
     db_conn.commit()
     
-    # --- Performance Tracking Initialization ---
-    total_cache_hits = 0
-    total_cache_misses = 0
+    total_cache_hit_score = 0.0
+    total_cache_miss_score = 0.0
     start_time = time.time()
 
     while True:
@@ -262,35 +268,41 @@ def main():
                     
                     current_leechers = t.get('num_incomplete', 0)
                     current_seeders = t.get('num_complete', 0)
+                    current_uploaded_bytes = t.get('uploaded', 0)
 
                     if not db_entry:
                         location = 'ssd' if t['content_path'].startswith(SSD_PATH) else 'array'
                         cursor.execute("""
                             INSERT INTO torrents (
                                 hash, name, size, save_path, content_path, master_content_path, master_save_path,
-                                location, added_on, last_checked, current_leechers, current_seeders
-                            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                                location, added_on, last_checked, current_leechers, current_seeders, total_uploaded
+                            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                         """, (
                             t['hash'], t['name'], t['size'], t['save_path'], t['content_path'], t['content_path'], t['save_path'],
-                            location, t['added_on'], current_timestamp, current_leechers, current_seeders
+                            location, t['added_on'], current_timestamp, current_leechers, current_seeders, current_uploaded_bytes
                         ))
                         db_conn.commit()
                         cursor.execute("SELECT * FROM torrents WHERE hash = %s", (t['hash'],))
                         db_entry = cursor.fetchone()
 
-                    # --- Cache Hit/Miss Logic ---
-                    # Each leecher is a "request". If the torrent is on the SSD, it's a "hit". Otherwise, it's a "miss".
-                    if current_leechers > 0:
+                    # Calculate I/O stress score based on upload delta and peer count.
+                    previous_uploaded_bytes = db_entry.get('total_uploaded', 0)
+                    upload_delta = current_uploaded_bytes - previous_uploaded_bytes
+
+                    if upload_delta > 0:
+                        io_stress_score = upload_delta * (current_leechers + 1)
                         if db_entry['location'] == 'ssd':
-                            total_cache_hits += current_leechers
+                            total_cache_hit_score += io_stress_score
                         else:
-                            total_cache_misses += current_leechers
+                            total_cache_miss_score += io_stress_score
                     
                     cursor.execute("""
-                        UPDATE torrents SET last_checked = %s, current_leechers = %s, current_seeders = %s, name = %s
+                        UPDATE torrents 
+                        SET last_checked = %s, current_leechers = %s, current_seeders = %s, name = %s, total_uploaded = %s
                         WHERE hash = %s
-                    """, (current_timestamp, current_leechers, current_seeders, t['name'], t['hash']))
+                    """, (current_timestamp, current_leechers, current_seeders, t['name'], current_uploaded_bytes, t['hash']))
                     
+                    # Calculate the placement score used for rebalancing decisions.
                     if current_leechers > 0:
                         sl_ratio_bonus = (current_leechers / (current_seeders + 1)) * WEIGHT_SL_RATIO
                         leechers_score = current_leechers * WEIGHT_LEECHERS
@@ -306,19 +318,18 @@ def main():
                 db_conn.commit()
                 logging.info("Stats updated and demand scores calculated for all torrents.")
                 
-                # --- The rest of the logic remains the same ---
-                
+                # --- Rebalancing Logic ---
                 all_db_torrents.sort(key=lambda x: x['weighted_score'], reverse=True)
                 
                 try:
-                    total_ssd_space, _, _ = shutil.disk_usage(SSD_PATH)
-                    used_ssd_space = sum(f.stat().st_size for f in Path(SSD_PATH).glob('**/*') if f.is_file())
+                    total, _, _ = shutil.disk_usage(SSD_PATH)
+                    used = sum(f.stat().st_size for f in Path(SSD_PATH).glob('**/*') if f.is_file())
                 except FileNotFoundError:
                     logging.error(f"SSD Path '{SSD_PATH}' not found. Skipping rebalancing cycle.")
                     time.sleep(CHECK_INTERVAL); continue
 
-                target_ssd_usage = total_ssd_space * (SSD_TARGET_CAPACITY_PERCENT / 100.0)
-                logging.info(f"SSD Status: {(used_ssd_space / (1024**3)):.2f} GB used / {(total_ssd_space / (1024**3)):.2f} GB total. Target usage: {(target_ssd_usage / (1024**3)):.2f} GB.")
+                target_ssd_usage = total * (SSD_TARGET_CAPACITY_PERCENT / 100.0)
+                logging.info(f"SSD Status: {(used / (1024**3)):.2f} GB used / {(total / (1024**3)):.2f} GB total. Target usage: {(target_ssd_usage / (1024**3)):.2f} GB.")
 
                 ideal_ssd_hashes, temp_size = set(), 0
                 for t in all_db_torrents:
@@ -346,7 +357,7 @@ def main():
                 current_used_space = sum(f.stat().st_size for f in Path(SSD_PATH).glob('**/*') if f.is_file())
                 for torrent in promotions_to_run:
                     if moves_done >= MAX_MOVES_PER_CYCLE: break
-                    if current_used_space + torrent['size'] <= total_ssd_space:
+                    if current_used_space + torrent['size'] <= total:
                         promote_torrent(qbit_client, cursor, torrent)
                         current_used_space += torrent['size']
                         moves_done += 1
@@ -371,15 +382,13 @@ def main():
         except Exception as e:
             logging.critical(f"An unhandled critical error occurred: {e}", exc_info=True); time.sleep(300)
         
-        # --- Display performance report at the end of the cycle ---
-        print_performance_report(total_cache_hits, total_cache_misses, start_time)
+        print_performance_report(total_cache_hit_score, total_cache_miss_score, start_time)
         
         logging.info(f"Cycle complete. Next check in {CHECK_INTERVAL / 3600:.1f} hour(s).")
         time.sleep(CHECK_INTERVAL)
 
 if __name__ == "__main__":
     required_vars = ['QBIT_HOST', 'QBIT_PORT', 'QBIT_USER', 'QBIT_PASS', 'DB_HOST', 'DB_PORT', 'DB_NAME', 'DB_USER', 'DB_PASS', 'SSD_PATH_IN_CONTAINER', 'ARRAY_PATH_IN_CONTAINER']
-    required_vars.extend(['WEIGHT_LEECHERS', 'WEIGHT_SL_RATIO']) 
     missing_vars = [var for var in required_vars if not os.environ.get(var)]
     if missing_vars:
         logging.critical(f"Critical environment variables are missing: {', '.join(missing_vars)}. Exiting.")
